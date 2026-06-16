@@ -114,3 +114,7 @@ To launch the demo, run:
 ```sh
 python app.py
 ```
+
+### Locality score
+
+Each result row also reports a `locality_score` column — adapted from [Null-Space Constrained Low-Rank Adaptation for Response-Specified Large Language Model Unlearning](https://arxiv.org/abs/2606.10989). The paper argues that a well-behaved adaptation should reach its task objective while perturbing benign, retained capabilities as little as possible (it confines updates to the null space of a "retain subspace"). The comparison benchmarks already record both sides of that trade-off per run: a task-quality metric (`test_accuracy` / `test_dino_similarity`) and a retain-side perturbation metric (`forgetting*` / `drift*`). The locality score is the harmonic mean of normalized task quality and normalized retention (`1 - normalized perturbation`), so it is high only for methods that reach strong quality *with* little retain-side damage. Higher is better.
