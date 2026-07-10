@@ -23,9 +23,18 @@ from torch import nn
 from peft.utils.integrations import dequantize_module_weight, gather_params_ctx
 from peft.utils.other import transpose
 
+from .factored_norm import weight_norm_from_factors
+
 
 ENABLE_DORA_CACHING = False
 """Whether to enable DoRA caching, which makes it faster at inference but requires more memory"""
+
+ENABLE_FACTORED_WEIGHT_NORM = False
+"""Whether to compute the DoRA weight norm from the low-rank factors B, A instead of materializing
+the dense ``B A`` product. This avoids the ``d_out x d_in`` (and, in the linear path, ``d_in x d_in``)
+transients that make high-rank DoRA infeasible on single GPUs (see Scaling DoRA,
+https://arxiv.org/abs/2603.22276v1). When on, the linear DoRA path reads ``lora_A``/``lora_B`` weights
+directly and is therefore not FSDP-safe, unlike the default module-forward path."""
 
 
 def cache_decorator(cache_key: str):
@@ -90,6 +99,22 @@ class DoraLinearLayer(nn.Module):
         weight_norm = torch.linalg.norm(weight, dim=1).to(weight.dtype)
         return weight_norm
 
+    @cache_decorator("weight-norm")
+    def get_weight_norm_factored(
+        self, weight, lora_A, lora_B, scaling, adapter_name: Optional[str] = None
+    ) -> torch.Tensor:
+        # Memory-efficient DoRA weight norm: compute ||W + s*B A|| from the low-rank factors B, A so the
+        # dense d_out x d_in product B A is never formed (see Scaling DoRA, arxiv.org/abs/2603.22276v1).
+        # ``lora_A``/``lora_B`` are the LoRA modules (as in ``forward``); their weights are read directly.
+        weight_norm = weight_norm_from_factors(
+            weight=weight,
+            lora_A=lora_A.weight,
+            lora_B=lora_B.weight,
+            scaling=scaling,
+            fan_in_fan_out=self.fan_in_fan_out,
+        )
+        return weight_norm.to(weight.dtype)
+
     @cache_decorator("lora-weight")
     def get_lora_weight(self, lora_A, lora_B, adapter_name: Optional[str] = None):
         # Don't use `lora_weight = lora_B.weight @ lora_A.weight` because this causes errors with FSDP. Instead,
@@ -134,15 +159,22 @@ class DoraLinearLayer(nn.Module):
         For DoRA, calculate the extra output from LoRA with DoRA applied. This should be added on top of the base layer
         output.
         """
-        lora_weight = self.get_lora_weight(lora_A=lora_A, lora_B=lora_B, adapter_name=adapter_name)
-        lora_weight = lora_weight.to(x.dtype)
-
         magnitude = self.weight
         weight = dequantize_module_weight(base_layer)
         weight = weight.to(x.dtype)
-        weight_norm = self.get_weight_norm(
-            weight=weight, lora_weight=lora_weight.detach(), scaling=scaling, adapter_name=adapter_name
-        )
+        if ENABLE_FACTORED_WEIGHT_NORM:
+            # High-rank DoRA: compute ||W + s*B A|| from the factors B, A without forming B A
+            # (Scaling DoRA, arxiv.org/abs/2603.22276v1). Reads lora_A/lora_B weights directly, so unlike
+            # the default path it is not FSDP-safe.
+            weight_norm = self.get_weight_norm_factored(
+                weight=weight, lora_A=lora_A, lora_B=lora_B, scaling=scaling, adapter_name=adapter_name
+            )
+        else:
+            lora_weight = self.get_lora_weight(lora_A=lora_A, lora_B=lora_B, adapter_name=adapter_name)
+            lora_weight = lora_weight.to(x.dtype)
+            weight_norm = self.get_weight_norm(
+                weight=weight, lora_weight=lora_weight.detach(), scaling=scaling, adapter_name=adapter_name
+            )
         # see section 4.3 of DoRA (https://huggingface.co/papers/2402.09353)
         # "[...] we suggest treating ||V +∆V ||_c in
         # Eq. (5) as a constant, thereby detaching it from the gradient
