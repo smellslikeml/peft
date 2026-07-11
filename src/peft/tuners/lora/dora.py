@@ -23,9 +23,20 @@ from torch import nn
 from peft.utils.integrations import dequantize_module_weight, gather_params_ctx
 from peft.utils.other import transpose
 
+from .factored_weight_norm import factored_weight_norm
+
 
 ENABLE_DORA_CACHING = False
 """Whether to enable DoRA caching, which makes it faster at inference but requires more memory"""
+
+USE_FACTORED_DORA_NORM = False
+"""Whether to compute the DoRA weight norm via the factored decomposition (base + cross + Gram terms).
+
+When enabled, ``DoraLinearLayer.forward`` avoids materializing the dense ``[d_out, d_in]`` product ``B @ A`` just to
+take its column-wise norm, trading it for ``O(d_out·r + r^2)`` intermediates. This lowers peak memory for high-rank
+DoRA at the cost of a slightly different floating-point accumulation order. See ``factored_weight_norm``. Off by
+default to preserve the exact numerics of the existing implementation.
+"""
 
 
 def cache_decorator(cache_key: str):
@@ -134,15 +145,24 @@ class DoraLinearLayer(nn.Module):
         For DoRA, calculate the extra output from LoRA with DoRA applied. This should be added on top of the base layer
         output.
         """
-        lora_weight = self.get_lora_weight(lora_A=lora_A, lora_B=lora_B, adapter_name=adapter_name)
-        lora_weight = lora_weight.to(x.dtype)
-
         magnitude = self.weight
         weight = dequantize_module_weight(base_layer)
         weight = weight.to(x.dtype)
-        weight_norm = self.get_weight_norm(
-            weight=weight, lora_weight=lora_weight.detach(), scaling=scaling, adapter_name=adapter_name
-        )
+        if USE_FACTORED_DORA_NORM:
+            # The dense product B @ A is only ever consumed by the norm here, so compute the norm directly from the
+            # factors and skip materializing the [d_out, d_in] delta entirely.
+            weight_norm = factored_weight_norm(
+                transpose(weight, self.fan_in_fan_out),
+                lora_A.weight.to(x.dtype),
+                lora_B.weight.to(x.dtype),
+                scaling,
+            ).to(weight.dtype)
+        else:
+            lora_weight = self.get_lora_weight(lora_A=lora_A, lora_B=lora_B, adapter_name=adapter_name)
+            lora_weight = lora_weight.to(x.dtype)
+            weight_norm = self.get_weight_norm(
+                weight=weight, lora_weight=lora_weight.detach(), scaling=scaling, adapter_name=adapter_name
+            )
         # see section 4.3 of DoRA (https://huggingface.co/papers/2402.09353)
         # "[...] we suggest treating ||V +∆V ||_c in
         # Eq. (5) as a constant, thereby detaching it from the gradient
