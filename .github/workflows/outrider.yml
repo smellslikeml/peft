@@ -35,6 +35,10 @@ on:
         description: 'Optional hand-crafted implementation spec (landing-zone-to-PR mode). Overrides suggested_experiment.'
         required: false
         default: ''
+      start-from-ref:
+        description: 'Optional branch/tag/SHA to start the coding session from (REMYX-219 refinement mode).'
+        required: false
+        default: ''
 
 jobs:
   recommend:
@@ -70,5 +74,6 @@ jobs:
           pin-arxiv: ${{ inputs.pin-arxiv }}
           claude-timeout: ${{ inputs.claude-timeout }}
           lead-content: ${{ inputs.lead-content }}
+          start-from-ref: ${{ inputs.start-from-ref }}
           publish: ${{ inputs.publish }}
           model-base-url: ${{ inputs.provider == 'zai' && 'https://api.z.ai/api/anthropic' || '' }}
