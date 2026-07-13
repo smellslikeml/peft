@@ -3,16 +3,17 @@ fork: smellslikeml/peft
 observed_landing_zones:
 - path: src/peft/tuners/supertuning/
   shape_tags:
-  - library-shape-public-api
+  - registry-add
   confirmed_by:
   - arxiv: 2607.09287v1
-    mode: Mode 2 (adapted port)
-    call_site_specifics: 'External library API: SupertuningConfig and SupertuningModel
-      are exported from src/peft/__init__.py, imported by users via `from peft import
-      SupertuningConfig, SupertuningModel`. The library has setup'
-    branch: super-tuning-from-activation-aware-pruning-to-sparse-fine-tu-v2
-    timestamp: '2026-07-13T22:21:36Z'
-  last_observed: '2026-07-13T22:21:36Z'
+    mode: Mode 1 (direct port)
+    call_site_specifics: "SupertuningModel.set_trainable_parameters (src/peft/tuners/supertuning/model.py),\
+      \ a pre-existing public method, now calls module.enable_gradient_masking()/disable_gradient_masking()\
+      \ \u2192 gradient_masking"
+    branch: super-tuning-from-activation-aware-pruning-to-sparse-fine-tu
+    timestamp: '2026-07-13T23:49:58Z'
+    pr: 9
+  last_observed: '2026-07-13T23:49:58Z'
 rejected_shapes: []
 coordination_signals: []
-last_updated: '2026-07-13T22:21:36Z'
+last_updated: '2026-07-13T23:49:58Z'
