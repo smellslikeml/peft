@@ -59,7 +59,7 @@ class SupertuningModel(BaseTuner):
         >>> supertuning_model = SupertuningModel(model, config, adapter_name="default")
         ```
 
-    Paper: https://arxiv.org/abs/2607.09287v1
+    Paper: https://arxiv.org/abs/2607.09287
 
     **Attributes**:
         - **model** ([`~transformers.PreTrainedModel`]) -- The model to be adapted.
@@ -201,33 +201,6 @@ class SupertuningModel(BaseTuner):
         if hasattr(module, "_activation_stats"):
             module._activation_stats[adapter_name] = activation.detach()
 
-    def set_trainable_parameters(self, adapter_name: str = "default"):
-        """
-        Set the trainable parameters based on the sparse masks.
-
-        The base weight is made trainable, and a weight-gradient hook is installed so that only the entries selected
-        by the sparse support actually receive updates during optimization (see
-        [`~peft.tuners.supertuning.gradient_masking`]). This is what keeps the frozen parameters unchanged; enabling
-        ``requires_grad`` alone would let the whole weight be updated.
-
-        Args:
-            adapter_name: Name of the adapter to apply. Defaults to "default".
-        """
-        for name, module in self.model.named_modules():
-            if isinstance(module, Linear):
-                base_layer = module.get_base_layer()
-
-                if adapter_name in module.supertuning_sparse_mask.keys():
-                    base_layer.weight.requires_grad = True
-                    if module.use_gradient_masking:
-                        module.enable_gradient_masking()
-                    else:
-                        module.disable_gradient_masking()
-                else:
-                    # No mask, disable gradients
-                    base_layer.weight.requires_grad = False
-                    module.disable_gradient_masking()
-
     def get_trainable_parameters_count(self, adapter_name: str = "default") -> dict:
         """
         Get the count of trainable parameters for the given adapter.
@@ -247,9 +220,8 @@ class SupertuningModel(BaseTuner):
                 weight_numel = base_layer.weight.numel()
                 total_params += weight_numel
 
-                if adapter_name in module.supertuning_sparse_mask.keys():
-                    mask = module.supertuning_sparse_mask[adapter_name]
-                    trainable_params += int(mask.sum().item())
+                if adapter_name in module.supertuning_values.keys():
+                    trainable_params += int(module.supertuning_values[adapter_name].numel())
 
         return {
             "total_parameters": total_params,

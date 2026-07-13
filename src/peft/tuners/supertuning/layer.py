@@ -18,10 +18,54 @@ from typing import Any, Optional
 import torch
 from torch import nn
 
+from peft.tuners._buffer_dict import BufferDict
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 
 from .config import SupertuningConfig
-from .gradient_masking import register_gradient_mask_hook, remove_gradient_mask_hook
+
+
+class DensePlusSparseLinear(torch.autograd.Function):
+    """
+    Linear layer whose effective weight is the frozen base weight plus a sparse update.
+
+    The sparse update is described by ``indices`` (flat positions into the weight) and ``values`` (the trainable
+    quantities scatter-added at those positions). The backward pass only propagates a gradient to ``values`` (and to
+    the input/bias); the base ``weight`` receives none, which is what keeps the frozen support unchanged during
+    optimization. This mirrors the reference Super-Tuning implementation and, unlike masking a dense weight gradient,
+    behaves correctly under stateful optimizers such as AdamW.
+    """
+
+    @staticmethod
+    def forward(ctx, input, weight, indices, values, bias=None):
+        ctx.save_for_backward(input, weight, indices, values, bias)
+
+        dense_plus_sparse = weight.reshape(-1).scatter_add(0, indices.to(torch.int64), values.to(weight.dtype))
+        dense_plus_sparse = dense_plus_sparse.reshape_as(weight)
+
+        return torch.nn.functional.linear(input, dense_plus_sparse, bias)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, weight, indices, values, bias = ctx.saved_tensors
+        grad_input = grad_values = grad_bias = None
+
+        dense_plus_sparse = weight.reshape(-1).scatter_add(0, indices.to(torch.int64), values.to(weight.dtype))
+        dense_plus_sparse = dense_plus_sparse.reshape_as(weight)
+
+        if ctx.needs_input_grad[0]:
+            grad_input = torch.matmul(grad_output, dense_plus_sparse)
+
+        if ctx.needs_input_grad[3] or (bias is not None and ctx.needs_input_grad[4]):
+            grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
+            if ctx.needs_input_grad[3]:
+                input_2d = input.reshape(-1, input.shape[-1])
+                grad_matrix = grad_output_2d.t().mm(input_2d)
+                grad_values = grad_matrix.reshape(-1).gather(0, indices.to(torch.int64)).to(values.dtype)
+            if bias is not None and ctx.needs_input_grad[4]:
+                grad_bias = grad_output_2d.sum(dim=0)
+
+        # No gradient flows to the (frozen) base weight or to the integer indices.
+        return grad_input, None, None, grad_values, grad_bias
 
 
 class SupertuningLayer(BaseTunerLayer):
@@ -32,17 +76,23 @@ class SupertuningLayer(BaseTunerLayer):
     - Wanda-style activation-weighted magnitude scoring
     - Magnitude-only scoring (PaFi-style baseline)
 
-    Then it creates a binary mask that selects the top-k parameters to train.
+    It then selects the top-k most salient parameters as the trainable sparse support and stores that support as a
+    compact ``(indices, values)`` pair sized to the trainable count: ``indices`` are the flat positions of the support
+    inside the weight and ``values`` are the trainable quantities scatter-added onto the frozen base weight. Only
+    ``values`` is a trainable parameter; the base weight is frozen.
     """
 
-    # All names of layers that may contain adapter weights
-    adapter_layer_names = ("supertuning_sparse_mask",)
+    # All names of layers that may contain (trainable) adapter weights
+    adapter_layer_names = ("supertuning_values",)
 
     def __init__(self, base_layer: nn.Module, **kwargs) -> None:
         self.base_layer = base_layer
-        self.supertuning_sparse_mask = nn.ParameterDict({})
+        # Trainable sparse quantities, one 1-D parameter per adapter.
+        self.supertuning_values = nn.ParameterDict({})
+        # Flat positions of the sparse support inside the weight, one 1-D integer buffer per adapter. Persistent so
+        # that it is saved alongside ``supertuning_values`` in the adapter checkpoint.
+        self.supertuning_indices = BufferDict(persistent=True)
         self._activation_stats = {}  # Store activation statistics for calibration
-        self._gradient_mask_handle = None  # Handle of the weight-gradient masking hook, if enabled
         # Mark the weight as unmerged
         self._disable_adapters = False
         self.merged_adapters = []
@@ -55,57 +105,49 @@ class SupertuningLayer(BaseTunerLayer):
         self.in_features = in_features
         self.out_features = out_features
 
+    def _num_trainable(self, num_params: int, sparsity: float) -> int:
+        """Number of trainable parameters given the (frozen) sparsity ratio."""
+        return int(num_params * (1 - sparsity))
+
     def update_layer(self, adapter_name: str, config: SupertuningConfig, **kwargs):
         """
         Update the layer with a new adapter configuration.
 
-        This method initializes the sparse mask based on the saliency scoring method.
+        This method selects the sparse support (``indices``) based on the saliency scoring method and allocates the
+        trainable ``values`` for it.
         """
         base_layer = self.get_base_layer()
-        init_weights = config.init_weights
-        inference_mode = config.inference_mode
         sparsity = config.sparsity
         scoring_method = config.scoring_method
+        init_weights = config.init_weights
 
         # Get the weight tensor
         weight = base_layer.weight.data  # shape: (out_features, in_features)
 
-        # Compute initial saliency scores
+        # Compute initial saliency scores. Wanda scoring is refined later during calibration; until then both methods
+        # fall back to the weight magnitude.
         if scoring_method == "magnitude":
-            # Magnitude-only scoring (PaFi-style)
             scores = weight.abs().flatten()
         else:  # "wanda"
-            # Wanda-style: activation-weighted magnitude
-            # Initialize with magnitude only, will be updated during calibration
             scores = weight.abs().flatten()
 
-        # Determine number of parameters to keep trainable
+        # Select the most salient parameters as the trainable support.
         num_params = scores.numel()
-        num_trainable = int(num_params * (1 - sparsity))
-
-        # Select top-k indices (lowest score = least salient = pruned)
-        # We want to keep the most salient parameters
+        num_trainable = self._num_trainable(num_params, sparsity)
         _, indices = torch.topk(scores, k=num_trainable, largest=True)
+        indices = indices.to(dtype=torch.int32, device=weight.device)
 
-        # Create binary mask: 1 for trainable, 0 for frozen
-        mask = torch.zeros(num_params, device=weight.device)
-        mask[indices] = 1.0
-        mask = mask.reshape_as(weight)
-
-        self.supertuning_sparse_mask[adapter_name] = nn.Parameter(mask, requires_grad=False)
-
+        self.supertuning_indices[adapter_name] = indices
+        # ``values`` start at zero, i.e. an identity update. ``init_weights=False`` seeds a non-identity update, which
+        # is only used to exercise a non-trivial adapter in tests.
         if init_weights:
-            self.reset_supertuning_parameters(adapter_name)
-        self._move_adapter_to_device_of_base_layer(adapter_name)
-        self.set_adapter(self.active_adapters, inference_mode=inference_mode)
+            values = torch.zeros(num_trainable, dtype=torch.float32, device=weight.device)
+        else:
+            values = torch.randn(num_trainable, dtype=torch.float32, device=weight.device)
+        self.supertuning_values[adapter_name] = nn.Parameter(values)
 
-    def reset_supertuning_parameters(self, adapter_name: str):
-        """
-        Reset the sparse mask. This is called during initialization.
-        """
-        if adapter_name in self.supertuning_sparse_mask.keys():
-            # Mask is already set during update_layer, this is a no-op
-            pass
+        self._move_adapter_to_device_of_base_layer(adapter_name)
+        self.set_adapter(self.active_adapters, inference_mode=config.inference_mode)
 
     def compute_saliency_wanda(self, weight: torch.Tensor, activations: torch.Tensor) -> torch.Tensor:
         """
@@ -144,9 +186,10 @@ class SupertuningLayer(BaseTunerLayer):
         self, adapter_name: str, activations: torch.Tensor, config: SupertuningConfig
     ):
         """
-        Update the sparse mask based on activation-aware saliency.
+        Re-select the sparse support based on activation-aware saliency.
 
-        This should be called during the calibration pass with sample data.
+        This should be called during the calibration pass with sample data. It only updates ``indices`` (the support
+        positions); the trainable count and the ``values`` allocation are unchanged.
 
         Args:
             adapter_name: Name of the adapter
@@ -162,41 +205,22 @@ class SupertuningLayer(BaseTunerLayer):
         else:  # "magnitude"
             scores = self.compute_saliency_magnitude(weight)
 
-        # Determine number of parameters to keep trainable
+        # Re-select the most salient parameters as the trainable support.
         num_params = scores.numel()
-        num_trainable = int(num_params * (1 - config.sparsity))
-
-        # Select top-k indices
+        num_trainable = self._num_trainable(num_params, config.sparsity)
         _, indices = torch.topk(scores.flatten(), k=num_trainable, largest=True)
 
-        # Update binary mask
-        mask = torch.zeros(num_params, device=weight.device)
-        mask[indices] = 1.0
-        mask = mask.reshape_as(weight)
-
-        self.supertuning_sparse_mask[adapter_name].data = mask
-
-    def enable_gradient_masking(self):
-        """
-        Enforce the sparse support by masking the weight gradient.
-
-        Registers a single tensor hook on the wrapped weight so that, during the backward pass, gradient entries
-        outside the sparse support are zeroed. This is the mechanism that actually keeps the frozen parameters
-        unchanged during optimization. Safe to call repeatedly: any previous hook is removed first.
-        """
-        return register_gradient_mask_hook(self)
-
-    def disable_gradient_masking(self):
-        """Remove the weight-gradient masking hook, letting the full weight receive updates again."""
-        remove_gradient_mask_hook(self)
+        self.supertuning_indices[adapter_name] = indices.to(
+            dtype=torch.int32, device=self.supertuning_indices[adapter_name].device
+        )
 
 
 class Linear(nn.Module, SupertuningLayer):
     """
     Supertuning implemented in a dense linear layer.
 
-    This layer applies gradient masking to ensure only parameters in the sparse
-    support (selected by the mask) receive updates during training.
+    The base weight is frozen; the sparse support is scatter-added onto it in the forward pass through a custom
+    autograd function so that only the trainable ``values`` receive a gradient.
     """
 
     # Supertuning implemented in a dense layer
@@ -210,44 +234,89 @@ class Linear(nn.Module, SupertuningLayer):
         super().__init__()
         SupertuningLayer.__init__(self, base_layer)
         self._active_adapter = adapter_name
-        self.use_gradient_masking = config.use_gradient_masking
         self.update_layer(adapter_name, config=config)
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
         """
-        Merge the sparse adapter. For Supertuning, this is a no-op since we're not
-        adding parameters but rather selecting which existing parameters to train.
+        Merge the sparse support into the base weight by scatter-adding the trained ``values`` at their ``indices``.
         """
-        # Supertuning doesn't have separate parameters to merge
-        # The sparse mask controls which base parameters are trainable
         adapter_names = check_adapters_to_merge(self, adapter_names)
         if not adapter_names:
             return
 
+        base_layer = self.get_base_layer()
         for active_adapter in adapter_names:
-            if active_adapter in self.supertuning_sparse_mask.keys():
-                self.merged_adapters.append(active_adapter)
+            if active_adapter not in self.supertuning_values.keys():
+                continue
+            weight = base_layer.weight
+            indices = self.supertuning_indices[active_adapter].to(torch.int64)
+            values = self.supertuning_values[active_adapter].to(weight.dtype)
+
+            if safe_merge:
+                merged = weight.data.reshape(-1).scatter_add(0, indices, values).reshape_as(weight)
+                if not torch.isfinite(merged).all():
+                    raise ValueError(
+                        f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
+                    )
+                weight.data = merged
+            else:
+                weight.data.reshape(-1).scatter_add_(0, indices, values)
+            self.merged_adapters.append(active_adapter)
 
     def unmerge(self) -> None:
         """
-        Unmerge the sparse adapter.
+        Unmerge the sparse support from the base weight by subtracting the merged ``values``.
         """
         if not self.merged:
             warnings.warn("Already unmerged. Nothing to do.")
             return
 
+        base_layer = self.get_base_layer()
         while len(self.merged_adapters) > 0:
-            self.merged_adapters.pop()
+            active_adapter = self.merged_adapters.pop()
+            if active_adapter not in self.supertuning_values.keys():
+                continue
+            weight = base_layer.weight
+            indices = self.supertuning_indices[active_adapter].to(torch.int64)
+            values = self.supertuning_values[active_adapter].to(weight.dtype)
+            weight.data.reshape(-1).scatter_add_(0, indices, -values)
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         """
         Forward pass.
 
-        Supertuning does not modify the forward computation: it reuses the base layer as-is. The sparse support is
-        enforced on the backward pass instead, through the weight-gradient hook installed by
-        ``enable_gradient_masking`` (registered once, not per forward). Keeping ``forward`` free of hook registration
-        avoids the hook leak and the shape mismatch of masking the layer-output gradient.
+        The frozen base weight is combined with the active adapters' sparse support and applied as a single linear
+        layer. The combination is done through :class:`DensePlusSparseLinear` so that the backward pass only reaches
+        the trainable ``values``.
         """
-        if self.disable_adapters and self.merged:
-            self.unmerge()
-        return self.base_layer(x, *args, **kwargs)
+        if self.disable_adapters:
+            if self.merged:
+                self.unmerge()
+            return self.base_layer(x, *args, **kwargs)
+
+        if self.merged:
+            return self.base_layer(x, *args, **kwargs)
+
+        active_adapters = [a for a in self.active_adapters if a in self.supertuning_values.keys()]
+        if not active_adapters:
+            return self.base_layer(x, *args, **kwargs)
+
+        base_layer = self.get_base_layer()
+        weight = base_layer.weight
+        bias = base_layer.bias
+
+        if len(active_adapters) == 1:
+            adapter_name = active_adapters[0]
+            return DensePlusSparseLinear.apply(
+                x, weight, self.supertuning_indices[adapter_name], self.supertuning_values[adapter_name], bias
+            )
+
+        # Multiple active adapters: combine their sparse supports on top of the frozen weight. The frozen weight
+        # receives no gradient, so the native ``scatter_add`` autograd is sufficient here.
+        dense_plus_sparse = weight.reshape(-1)
+        for adapter_name in active_adapters:
+            indices = self.supertuning_indices[adapter_name].to(torch.int64)
+            values = self.supertuning_values[adapter_name].to(weight.dtype)
+            dense_plus_sparse = dense_plus_sparse.scatter_add(0, indices, values)
+        dense_plus_sparse = dense_plus_sparse.reshape_as(weight)
+        return torch.nn.functional.linear(x, dense_plus_sparse, bias)

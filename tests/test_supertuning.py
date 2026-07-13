@@ -48,8 +48,8 @@ class TestSupertuning:
         with pytest.raises(ValueError, match="scoring_method must be"):
             SupertuningConfig(scoring_method="invalid")
 
-    def test_supertuning_state_dict(self, tmp_path):
-        """Test that Supertuning state dict can be saved and loaded."""
+    def test_supertuning_identity_init(self):
+        """With zero-initialized values, the sparse update is the identity and does not change the output."""
         torch.manual_seed(0)
 
         inputs = torch.arange(10).view(-1, 1).to(self.device)
@@ -61,25 +61,53 @@ class TestSupertuning:
         config = SupertuningConfig(
             target_modules=["q_proj", "v_proj"],
             sparsity=0.5,
+            init_weights=True,
+        )
+        model = get_peft_model(model, config)
+        model.eval()
+        output_peft = model(inputs).logits
+
+        # values start at zero, so the effective weight equals the base weight exactly
+        assert torch.allclose(output_base, output_peft, atol=1e-6, rtol=1e-6)
+
+    def test_supertuning_state_dict(self, tmp_path):
+        """Test that Supertuning saves only the compact (indices, values) support and round-trips."""
+        torch.manual_seed(0)
+
+        inputs = torch.arange(10).view(-1, 1).to(self.device)
+        model_id = "peft-internal-testing/tiny-random-OPTForCausalLM"
+        model = AutoModelForCausalLM.from_pretrained(model_id).to(self.device)
+
+        config = SupertuningConfig(
+            target_modules=["q_proj", "v_proj"],
+            sparsity=0.5,
+            # non-identity update so the round-trip actually exercises the trained values
             init_weights=False,
         )
         model = get_peft_model(model, config)
         model.eval()
         output_peft = model(inputs).logits
 
-        atol, rtol = 1e-5, 1e-8
-        # sanity check: loading supertuning should not change output (mask is uniform initially)
-        # Output may differ slightly due to numerical effects, but should be close
-        assert torch.allclose(output_base, output_peft, atol=atol * 10, rtol=rtol * 10)
-
         model.save_pretrained(tmp_path)
         del model
 
-        # check that the sparse mask is present in state dict
+        # the adapter checkpoint stores the compact sparse support: 1-D values and indices sized to the trainable
+        # count, and nothing resembling a full dense mask.
         state_dict = load_file(tmp_path / "adapter_model.safetensors")
-        assert any("sparse_mask" in key for key in state_dict)
+        assert any("supertuning_values" in key for key in state_dict)
+        assert any("supertuning_indices" in key for key in state_dict)
+        assert not any("sparse_mask" in key for key in state_dict)
+        values_keys = [key for key in state_dict if "supertuning_values" in key]
+        assert values_keys
+        for key in values_keys:
+            values = state_dict[key]
+            indices = state_dict[key.replace("supertuning_values", "supertuning_indices")]
+            # support is a 1-D pair sized to the trainable count (sparse storage, not the full weight numel)
+            assert values.ndim == 1
+            assert indices.shape == values.shape
 
-        # sanity check: the model still produces output after loading
+        atol, rtol = 1e-5, 1e-8
+        # the trained sparse values survive the round-trip
         model = AutoModelForCausalLM.from_pretrained(model_id).to(self.device)
         model = PeftModel.from_pretrained(model, tmp_path)
         output_loaded = model(inputs).logits
@@ -172,20 +200,26 @@ class TestSupertuning:
         kwargs.update(config_kwargs)
         config = SupertuningConfig(**kwargs)
         model = get_peft_model(model, config)
-        # set_trainable_parameters installs the weight-gradient masking hook (the integration point under test)
-        model.base_model.set_trainable_parameters()
         return model
 
     def _supertuning_layers(self, model):
         return [module for module in model.modules() if isinstance(module, SupertuningLinear)]
 
-    @staticmethod
-    def _num_weight_hooks(weight):
-        hooks = weight._backward_hooks
-        return 0 if hooks is None else len(hooks)
+    def test_supertuning_base_weight_frozen(self):
+        """The base weight is frozen; only the sparse ``values`` are trainable."""
+        torch.manual_seed(0)
+        model = self._prepare_trainable_model()
 
-    def test_supertuning_gradient_masking_zeros_out_of_support(self):
-        """Weight gradients outside the sparse support must be exactly zero after backward."""
+        saw_layer = False
+        for layer in self._supertuning_layers(model):
+            saw_layer = True
+            weight = layer.get_base_layer().weight
+            assert weight.requires_grad is False
+            assert layer.supertuning_values["default"].requires_grad is True
+        assert saw_layer
+
+    def test_supertuning_gradient_only_reaches_values(self):
+        """Backward must not accumulate any gradient on the frozen base weight."""
         torch.manual_seed(0)
         model = self._prepare_trainable_model()
         inputs = torch.arange(10).view(-1, 1).to(self.device)
@@ -195,63 +229,56 @@ class TestSupertuning:
         saw_support_signal = False
         for layer in self._supertuning_layers(model):
             weight = layer.get_base_layer().weight
-            mask = layer.supertuning_sparse_mask["default"]
-            assert weight.grad is not None
-            # gradient is masked to the fixed support: everything outside is exactly zero
-            assert torch.all(weight.grad[mask == 0] == 0)
-            if torch.any(weight.grad[mask == 1] != 0):
+            values = layer.supertuning_values["default"]
+            # the frozen weight receives no gradient at all
+            assert weight.grad is None
+            assert values.grad is not None
+            if torch.any(values.grad != 0):
                 saw_support_signal = True
-        # the masking must not zero *everything* — the support still learns
+        # the support still learns
         assert saw_support_signal
 
     def test_supertuning_optimizer_step_only_updates_support(self):
-        """After an optimizer step, only parameters inside the sparse support change."""
+        """After an optimizer step, the frozen weight is untouched and only the sparse support changes.
+
+        Uses AdamW, whose stateful update would leak into the frozen entries under the old gradient-masking
+        mechanism but cannot here since the base weight receives no gradient.
+        """
         torch.manual_seed(0)
         model = self._prepare_trainable_model()
         inputs = torch.arange(10).view(-1, 1).to(self.device)
 
-        optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=1.0)
+        optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1.0)
         layer = self._supertuning_layers(model)[0]
         weight = layer.get_base_layer().weight
-        mask = layer.supertuning_sparse_mask["default"]
-        before = weight.detach().clone()
+        values = layer.supertuning_values["default"]
+        weight_before = weight.detach().clone()
+        values_before = values.detach().clone()
 
         model(inputs).logits.float().sum().backward()
         optimizer.step()
 
-        after = weight.detach()
-        # frozen entries are untouched by the update
-        assert torch.equal(before[mask == 0], after[mask == 0])
-        # at least some support entries were updated
-        assert not torch.equal(before[mask == 1], after[mask == 1])
+        # the frozen base weight is never modified by the optimizer
+        assert torch.equal(weight_before, weight.detach())
+        # the sparse support (values) is updated
+        assert not torch.equal(values_before, values.detach())
 
-    def test_supertuning_gradient_hook_not_leaked(self):
-        """Enabling masking is idempotent: repeated calls / forwards do not stack hooks."""
+    def test_supertuning_forward_applies_sparse_update(self):
+        """The forward pass adds the sparse ``values`` at ``indices`` on top of the base weight."""
         torch.manual_seed(0)
-        model = self._prepare_trainable_model()
+        model = self._prepare_trainable_model(init_weights=False)
         inputs = torch.arange(10).view(-1, 1).to(self.device)
-        weight = self._supertuning_layers(model)[0].get_base_layer().weight
-
-        assert self._num_weight_hooks(weight) == 1
-        # repeated activation must not add a second hook
-        model.base_model.set_trainable_parameters()
-        assert self._num_weight_hooks(weight) == 1
-        # forward passes must not register any per-step hook either (the old bug)
-        for _ in range(3):
-            model(inputs).logits.float().sum().backward()
-        assert self._num_weight_hooks(weight) == 1
-
-    def test_supertuning_gradient_masking_can_be_disabled(self):
-        """With use_gradient_masking=False, the full weight receives gradient."""
-        torch.manual_seed(0)
-        model = self._prepare_trainable_model(use_gradient_masking=False)
-        inputs = torch.arange(10).view(-1, 1).to(self.device)
+        model.eval()
 
         layer = self._supertuning_layers(model)[0]
         weight = layer.get_base_layer().weight
-        mask = layer.supertuning_sparse_mask["default"]
-        assert self._num_weight_hooks(weight) == 0
+        indices = layer.supertuning_indices["default"].to(torch.int64)
+        values = layer.supertuning_values["default"].to(weight.dtype)
 
-        model(inputs).logits.float().sum().backward()
-        # without masking, gradient is allowed to be non-zero outside the support
-        assert torch.any(weight.grad[mask == 0] != 0)
+        # reconstruct the effective weight and compare against the module's own linear output
+        effective = weight.detach().reshape(-1).scatter_add(0, indices, values.detach()).reshape_as(weight)
+        x = torch.randn(3, layer.in_features).to(self.device).to(weight.dtype)
+        expected = torch.nn.functional.linear(x, effective, layer.get_base_layer().bias)
+        assert torch.allclose(layer(x), expected, atol=1e-5)
+        # the update is non-trivial
+        assert not torch.equal(effective, weight.detach())

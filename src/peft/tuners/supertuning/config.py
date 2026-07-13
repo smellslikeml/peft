@@ -50,12 +50,10 @@ class SupertuningConfig(PeftConfig):
             The method to use for computing saliency scores. Can be "wanda" (activation-weighted magnitude)
             or "magnitude" (magnitude-only, similar to PaFi). Defaults to "wanda".
         init_weights (`bool`):
-            Whether to initialize the sparse mask during setup. Defaults to `True`.
-        use_gradient_masking (`bool`):
-            Whether to apply gradient masking so only parameters in the sparse support receive updates.
+            Whether to initialize the trainable sparse values to zero (an identity update) during setup.
             Defaults to `True`.
 
-    Paper: https://arxiv.org/abs/2607.09287v1
+    Paper: https://arxiv.org/abs/2607.09287
     """
 
     target_modules: Optional[Union[list[str], str]] = field(
@@ -104,13 +102,7 @@ class SupertuningConfig(PeftConfig):
     )
     init_weights: bool = field(
         default=True,
-        metadata={"help": "Whether to initialize the sparse mask during setup."},
-    )
-    use_gradient_masking: bool = field(
-        default=True,
-        metadata={
-            "help": "Whether to apply gradient masking so only parameters in the sparse support receive updates."
-        },
+        metadata={"help": "Whether to initialize the trainable sparse values to zero (an identity update)."},
     )
 
     def __post_init__(self):
