@@ -21,6 +21,7 @@ from torch import nn
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 
 from .config import SupertuningConfig
+from .gradient_masking import register_gradient_mask_hook, remove_gradient_mask_hook
 
 
 class SupertuningLayer(BaseTunerLayer):
@@ -41,6 +42,7 @@ class SupertuningLayer(BaseTunerLayer):
         self.base_layer = base_layer
         self.supertuning_sparse_mask = nn.ParameterDict({})
         self._activation_stats = {}  # Store activation statistics for calibration
+        self._gradient_mask_handle = None  # Handle of the weight-gradient masking hook, if enabled
         # Mark the weight as unmerged
         self._disable_adapters = False
         self.merged_adapters = []
@@ -174,6 +176,20 @@ class SupertuningLayer(BaseTunerLayer):
 
         self.supertuning_sparse_mask[adapter_name].data = mask
 
+    def enable_gradient_masking(self):
+        """
+        Enforce the sparse support by masking the weight gradient.
+
+        Registers a single tensor hook on the wrapped weight so that, during the backward pass, gradient entries
+        outside the sparse support are zeroed. This is the mechanism that actually keeps the frozen parameters
+        unchanged during optimization. Safe to call repeatedly: any previous hook is removed first.
+        """
+        return register_gradient_mask_hook(self)
+
+    def disable_gradient_masking(self):
+        """Remove the weight-gradient masking hook, letting the full weight receive updates again."""
+        remove_gradient_mask_hook(self)
+
 
 class Linear(nn.Module, SupertuningLayer):
     """
@@ -225,44 +241,13 @@ class Linear(nn.Module, SupertuningLayer):
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         """
-        Forward pass with optional gradient masking.
+        Forward pass.
 
-        If gradient masking is enabled, gradients will only flow through parameters
-        selected by the sparse mask.
+        Supertuning does not modify the forward computation: it reuses the base layer as-is. The sparse support is
+        enforced on the backward pass instead, through the weight-gradient hook installed by
+        ``enable_gradient_masking`` (registered once, not per forward). Keeping ``forward`` free of hook registration
+        avoids the hook leak and the shape mismatch of masking the layer-output gradient.
         """
-        if self.disable_adapters:
-            if self.merged:
-                self.unmerge()
-            result = self.base_layer(x, *args, **kwargs)
-        elif self.merged:
-            result = self.base_layer(x, *args, **kwargs)
-        else:
-            # Get the sparse mask for active adapters
-            sparse_mask = None
-            for active_adapter in self.active_adapters:
-                if active_adapter not in self.supertuning_sparse_mask.keys():
-                    continue
-                current_mask = self.supertuning_sparse_mask[active_adapter]
-                if sparse_mask is None:
-                    sparse_mask = current_mask
-                else:
-                    # Combine masks (union of trainable parameters)
-                    sparse_mask = torch.clamp(sparse_mask + current_mask, 0, 1)
-
-            result = self.base_layer(x, *args, **kwargs)
-
-            # Apply gradient masking if enabled and a mask exists
-            if self.use_gradient_masking and sparse_mask is not None and self.training:
-                # Create a hook to mask gradients during backward pass
-                base_layer = self.get_base_layer()
-
-                def mask_grad(grad):
-                    if grad is not None:
-                        return grad * sparse_mask
-                    return grad
-
-                # Register backward hook for gradient masking
-                if base_layer.weight.requires_grad:
-                    base_layer.weight.register_backward_hook(lambda module, grad_input, grad_output: mask_grad(grad_output[0]))
-
-        return result
+        if self.disable_adapters and self.merged:
+            self.unmerge()
+        return self.base_layer(x, *args, **kwargs)

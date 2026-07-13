@@ -18,6 +18,7 @@ from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM
 
 from peft import PeftModel, SupertuningConfig, get_peft_model
+from peft.tuners.supertuning.layer import Linear as SupertuningLinear
 from peft.utils import infer_device
 
 
@@ -163,3 +164,94 @@ class TestSupertuning:
         assert "adapter2" in model.peft_config
         assert model.peft_config["adapter1"].sparsity == 0.5
         assert model.peft_config["adapter2"].sparsity == 0.3
+
+    def _prepare_trainable_model(self, **config_kwargs):
+        model_id = "peft-internal-testing/tiny-random-OPTForCausalLM"
+        model = AutoModelForCausalLM.from_pretrained(model_id).to(self.device)
+        kwargs = {"target_modules": ["q_proj", "v_proj"], "sparsity": 0.5, "scoring_method": "magnitude"}
+        kwargs.update(config_kwargs)
+        config = SupertuningConfig(**kwargs)
+        model = get_peft_model(model, config)
+        # set_trainable_parameters installs the weight-gradient masking hook (the integration point under test)
+        model.base_model.set_trainable_parameters()
+        return model
+
+    def _supertuning_layers(self, model):
+        return [module for module in model.modules() if isinstance(module, SupertuningLinear)]
+
+    @staticmethod
+    def _num_weight_hooks(weight):
+        hooks = weight._backward_hooks
+        return 0 if hooks is None else len(hooks)
+
+    def test_supertuning_gradient_masking_zeros_out_of_support(self):
+        """Weight gradients outside the sparse support must be exactly zero after backward."""
+        torch.manual_seed(0)
+        model = self._prepare_trainable_model()
+        inputs = torch.arange(10).view(-1, 1).to(self.device)
+
+        model(inputs).logits.float().sum().backward()
+
+        saw_support_signal = False
+        for layer in self._supertuning_layers(model):
+            weight = layer.get_base_layer().weight
+            mask = layer.supertuning_sparse_mask["default"]
+            assert weight.grad is not None
+            # gradient is masked to the fixed support: everything outside is exactly zero
+            assert torch.all(weight.grad[mask == 0] == 0)
+            if torch.any(weight.grad[mask == 1] != 0):
+                saw_support_signal = True
+        # the masking must not zero *everything* — the support still learns
+        assert saw_support_signal
+
+    def test_supertuning_optimizer_step_only_updates_support(self):
+        """After an optimizer step, only parameters inside the sparse support change."""
+        torch.manual_seed(0)
+        model = self._prepare_trainable_model()
+        inputs = torch.arange(10).view(-1, 1).to(self.device)
+
+        optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=1.0)
+        layer = self._supertuning_layers(model)[0]
+        weight = layer.get_base_layer().weight
+        mask = layer.supertuning_sparse_mask["default"]
+        before = weight.detach().clone()
+
+        model(inputs).logits.float().sum().backward()
+        optimizer.step()
+
+        after = weight.detach()
+        # frozen entries are untouched by the update
+        assert torch.equal(before[mask == 0], after[mask == 0])
+        # at least some support entries were updated
+        assert not torch.equal(before[mask == 1], after[mask == 1])
+
+    def test_supertuning_gradient_hook_not_leaked(self):
+        """Enabling masking is idempotent: repeated calls / forwards do not stack hooks."""
+        torch.manual_seed(0)
+        model = self._prepare_trainable_model()
+        inputs = torch.arange(10).view(-1, 1).to(self.device)
+        weight = self._supertuning_layers(model)[0].get_base_layer().weight
+
+        assert self._num_weight_hooks(weight) == 1
+        # repeated activation must not add a second hook
+        model.base_model.set_trainable_parameters()
+        assert self._num_weight_hooks(weight) == 1
+        # forward passes must not register any per-step hook either (the old bug)
+        for _ in range(3):
+            model(inputs).logits.float().sum().backward()
+        assert self._num_weight_hooks(weight) == 1
+
+    def test_supertuning_gradient_masking_can_be_disabled(self):
+        """With use_gradient_masking=False, the full weight receives gradient."""
+        torch.manual_seed(0)
+        model = self._prepare_trainable_model(use_gradient_masking=False)
+        inputs = torch.arange(10).view(-1, 1).to(self.device)
+
+        layer = self._supertuning_layers(model)[0]
+        weight = layer.get_base_layer().weight
+        mask = layer.supertuning_sparse_mask["default"]
+        assert self._num_weight_hooks(weight) == 0
+
+        model(inputs).logits.float().sum().backward()
+        # without masking, gradient is allowed to be non-zero outside the support
+        assert torch.any(weight.grad[mask == 0] != 0)

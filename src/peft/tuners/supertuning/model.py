@@ -205,8 +205,10 @@ class SupertuningModel(BaseTuner):
         """
         Set the trainable parameters based on the sparse masks.
 
-        This method ensures that only parameters selected by the sparse masks
-        have requires_grad=True.
+        The base weight is made trainable, and a weight-gradient hook is installed so that only the entries selected
+        by the sparse support actually receive updates during optimization (see
+        [`~peft.tuners.supertuning.gradient_masking`]). This is what keeps the frozen parameters unchanged; enabling
+        ``requires_grad`` alone would let the whole weight be updated.
 
         Args:
             adapter_name: Name of the adapter to apply. Defaults to "default".
@@ -216,21 +218,15 @@ class SupertuningModel(BaseTuner):
                 base_layer = module.get_base_layer()
 
                 if adapter_name in module.supertuning_sparse_mask.keys():
-                    mask = module.supertuning_sparse_mask[adapter_name]
-
-                    # Expand mask to match weight shape if needed
-                    if mask.shape != base_layer.weight.shape:
-                        mask = mask.expand_as(base_layer.weight)
-
-                    # Create a parameter that tracks which weights are trainable
-                    trainable_mask = mask.bool()
-
-                    # For now, we enable gradients on all weights
-                    # The actual masking happens during backward pass via hooks
                     base_layer.weight.requires_grad = True
+                    if module.use_gradient_masking:
+                        module.enable_gradient_masking()
+                    else:
+                        module.disable_gradient_masking()
                 else:
                     # No mask, disable gradients
                     base_layer.weight.requires_grad = False
+                    module.disable_gradient_masking()
 
     def get_trainable_parameters_count(self, adapter_name: str = "default") -> dict:
         """
