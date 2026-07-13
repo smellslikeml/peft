@@ -1,11 +1,6 @@
 name: Outrider
 
 on:
-  # Continuous-mode cron. Fires every 15 min; concurrency group serializes
-  # so only one Outrider dispatch runs at a time per fork — new invocations
-  # queue rather than parallel-firing.
-  schedule:
-    - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
       provider:
