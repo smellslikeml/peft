@@ -282,3 +282,38 @@ class TestSupertuning:
         assert torch.allclose(layer(x), expected, atol=1e-5)
         # the update is non-trivial
         assert not torch.equal(effective, weight.detach())
+
+    def test_supertuning_bottomk_selects_least_salient_support(self):
+        """selection_direction='bottom' keeps the least-salient entries as the trainable support.
+
+        Mirrors the paper's `magnitude-bottomk` / `super-wanda-bottom` variants. Verifies (a) the selected support is
+        disjoint from the TopK support at the same sparsity, and (b) every selected value has magnitude at most the
+        magnitude of every non-selected value.
+        """
+        torch.manual_seed(0)
+        top_model = self._prepare_trainable_model(sparsity=0.9, selection_direction="top")
+        torch.manual_seed(0)
+        bot_model = self._prepare_trainable_model(sparsity=0.9, selection_direction="bottom")
+
+        top_layer = self._supertuning_layers(top_model)[0]
+        bot_layer = self._supertuning_layers(bot_model)[0]
+        top_idx = set(top_layer.supertuning_indices["default"].tolist())
+        bot_idx = set(bot_layer.supertuning_indices["default"].tolist())
+
+        # at sparsity 0.9 the TopK and BottomK 10% supports do not overlap
+        assert top_idx.isdisjoint(bot_idx)
+
+        # every selected magnitude is at most every non-selected magnitude — i.e. the BottomK support is the
+        # least-salient set under magnitude scoring
+        weight_flat = bot_layer.get_base_layer().weight.detach().flatten().abs()
+        selected_mags = weight_flat[bot_layer.supertuning_indices["default"].long()]
+        mask = torch.ones_like(weight_flat, dtype=torch.bool)
+        mask[bot_layer.supertuning_indices["default"].long()] = False
+        non_selected_mags = weight_flat[mask]
+        assert selected_mags.max() <= non_selected_mags.min()
+
+        # and the module still trains — a backward pass reaches the BottomK values
+        inputs = torch.arange(10).view(-1, 1).to(self.device)
+        bot_model(inputs).logits.float().sum().backward()
+        assert bot_layer.supertuning_values["default"].grad is not None
+        assert bot_layer.get_base_layer().weight.grad is None

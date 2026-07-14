@@ -131,10 +131,12 @@ class SupertuningLayer(BaseTunerLayer):
         else:  # "wanda"
             scores = weight.abs().flatten()
 
-        # Select the most salient parameters as the trainable support.
+        # Select the trainable support: TopK (most-salient, paper's "Super"/"Supra") or BottomK
+        # (least-salient, paper's "-bottom" variants).
         num_params = scores.numel()
         num_trainable = self._num_trainable(num_params, sparsity)
-        _, indices = torch.topk(scores, k=num_trainable, largest=True)
+        largest = config.selection_direction == "top"
+        _, indices = torch.topk(scores, k=num_trainable, largest=largest)
         indices = indices.to(dtype=torch.int32, device=weight.device)
 
         self.supertuning_indices[adapter_name] = indices
@@ -205,10 +207,11 @@ class SupertuningLayer(BaseTunerLayer):
         else:  # "magnitude"
             scores = self.compute_saliency_magnitude(weight)
 
-        # Re-select the most salient parameters as the trainable support.
+        # Re-select the support, honoring the configured direction.
         num_params = scores.numel()
         num_trainable = self._num_trainable(num_params, config.sparsity)
-        _, indices = torch.topk(scores.flatten(), k=num_trainable, largest=True)
+        largest = config.selection_direction == "top"
+        _, indices = torch.topk(scores.flatten(), k=num_trainable, largest=largest)
 
         self.supertuning_indices[adapter_name] = indices.to(
             dtype=torch.int32, device=self.supertuning_indices[adapter_name].device

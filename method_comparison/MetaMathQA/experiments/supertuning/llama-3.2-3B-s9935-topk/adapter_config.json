@@ -1,0 +1,15 @@
+{
+  "auto_mapping": null,
+  "base_model_name_or_path": null,
+  "calibration_samples": 32,
+  "inference_mode": false,
+  "init_weights": true,
+  "modules_to_save": null,
+  "peft_type": "SUPERTUNING",
+  "revision": null,
+  "scoring_method": "magnitude",
+  "selection_direction": "top",
+  "sparsity": 0.9935,
+  "target_modules": ["q_proj", "v_proj"],
+  "task_type": "CAUSAL_LM"
+}

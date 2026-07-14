@@ -47,7 +47,14 @@ class SupertuningConfig(PeftConfig):
             32.
         scoring_method (`str`):
             The method to use for computing saliency scores. Can be "wanda" (activation-weighted magnitude) or
-            "magnitude" (magnitude-only, similar to PaFi). Defaults to "wanda".
+            "magnitude" (magnitude-only, similar to PaFi). Defaults to "magnitude" — the paper's own 8B ablation
+            reports magnitude-only outperforming Wanda (79.02% vs 78.66% average). "wanda" additionally requires a
+            calibration pass via `SupertuningModel.calibrate_saliency(dataset)`.
+        selection_direction (`str`):
+            Which end of the saliency score to keep as the trainable support. "top" keeps the most-salient entries (the
+            paper's "Super"/"Supra" configurations); "bottom" keeps the least-salient entries (the paper's "-bottom"
+            variants, e.g. `magnitude-bottomk`, `super-wanda-bottom`). The paper reports the best direction is not
+            universal and depends on model + task. Defaults to "top".
         init_weights (`bool`):
             Whether to initialize the trainable sparse values to zero (an identity update) during setup. Defaults to
             `True`.
@@ -89,11 +96,22 @@ class SupertuningConfig(PeftConfig):
         metadata={"help": "Number of calibration samples to compute activation-aware saliency scores."},
     )
     scoring_method: str = field(
-        default="wanda",
+        default="magnitude",
         metadata={
             "help": (
-                "Method for computing saliency scores. 'wanda' uses activation-weighted magnitude, "
-                "'magnitude' uses weight magnitude only."
+                "Method for computing saliency scores. 'wanda' uses activation-weighted magnitude and requires a "
+                "calibration pass via SupertuningModel.calibrate_saliency(dataset); 'magnitude' uses weight magnitude "
+                "only and needs no calibration. Defaults to 'magnitude' — see the paper's 8B ablation."
+            )
+        },
+    )
+    selection_direction: str = field(
+        default="top",
+        metadata={
+            "help": (
+                "Which end of the saliency score to keep as the trainable support. 'top' keeps the most-salient "
+                "entries (paper's 'Super'/'Supra' configs); 'bottom' keeps the least-salient (paper's '-bottom' "
+                "variants). Defaults to 'top'."
             )
         },
     )
@@ -116,3 +134,7 @@ class SupertuningConfig(PeftConfig):
         # Validate scoring_method
         if self.scoring_method not in ["wanda", "magnitude"]:
             raise ValueError(f"scoring_method must be 'wanda' or 'magnitude', got {self.scoring_method}")
+
+        # Validate selection_direction
+        if self.selection_direction not in ["top", "bottom"]:
+            raise ValueError(f"selection_direction must be 'top' or 'bottom', got {self.selection_direction}")
