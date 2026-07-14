@@ -241,8 +241,8 @@ class TestSupertuning:
     def test_supertuning_optimizer_step_only_updates_support(self):
         """After an optimizer step, the frozen weight is untouched and only the sparse support changes.
 
-        Uses AdamW, whose stateful update would leak into the frozen entries under the old gradient-masking
-        mechanism but cannot here since the base weight receives no gradient.
+        Uses AdamW, whose stateful update would leak into the frozen entries under the old gradient-masking mechanism
+        but cannot here since the base weight receives no gradient.
         """
         torch.manual_seed(0)
         model = self._prepare_trainable_model()

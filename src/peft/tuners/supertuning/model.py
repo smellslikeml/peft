@@ -27,9 +27,9 @@ class SupertuningModel(BaseTuner):
     """
     Supertuning Model: Activation-Aware Sparse Fine-Tuning.
 
-    This model implements sparse parameter-efficient fine-tuning by selecting a trainable support
-    based on pruning-inspired saliency signals. The method uses a Wanda-style activation-weighted
-    magnitude score computed from a calibration pass to determine which parameters should be trained.
+    This model implements sparse parameter-efficient fine-tuning by selecting a trainable support based on
+    pruning-inspired saliency signals. The method uses a Wanda-style activation-weighted magnitude score computed from
+    a calibration pass to determine which parameters should be trained.
 
     Args:
         model ([`~transformers.PreTrainedModel`]): The model to be adapted.
@@ -117,8 +117,8 @@ class SupertuningModel(BaseTuner):
         """
         Run the calibration pass to compute activation-aware saliency scores.
 
-        This method forwards calibration data through the model and updates the sparse masks
-        based on the observed activations.
+        This method forwards calibration data through the model and updates the sparse masks based on the observed
+        activations.
 
         Args:
             calibration_dataset: Dataset of calibration samples. Should be an iterable of
@@ -131,6 +131,7 @@ class SupertuningModel(BaseTuner):
 
         ```py
         >>> from transformers import AutoTokenizer
+
         >>> tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
         >>> calibration_texts = ["Sample text 1", "Sample text 2", ...]
         >>> inputs = tokenizer(calibration_texts, return_tensors="pt", padding=True)

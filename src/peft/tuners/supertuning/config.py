@@ -26,32 +26,31 @@ class SupertuningConfig(PeftConfig):
     """
     This is the configuration class to store the configuration of a [`SupertuningModel`].
 
-    Supertuning (Super-Tuning) implements activation-aware sparse fine-tuning using pruning-inspired saliency
-    signals to select which parameters should be trainable. The method uses a Wanda-style activation-weighted
-    magnitude score computed from a calibration pass to determine the sparse support.
+    Supertuning (Super-Tuning) implements activation-aware sparse fine-tuning using pruning-inspired saliency signals
+    to select which parameters should be trainable. The method uses a Wanda-style activation-weighted magnitude score
+    computed from a calibration pass to determine the sparse support.
 
     Args:
         target_modules (`Optional[Union[List[str], str]]`):
-            The names of the modules to apply the adapter to. If this is specified, only the modules with the
-            specified names will be replaced. When passing a string, a regex match will be performed. When
-            passing a list of strings, either an exact match will be performed or it is checked if the name
-            of the module ends with any of the passed strings. If this is not specified, modules will be chosen
-            according to the model architecture.
+            The names of the modules to apply the adapter to. If this is specified, only the modules with the specified
+            names will be replaced. When passing a string, a regex match will be performed. When passing a list of
+            strings, either an exact match will be performed or it is checked if the name of the module ends with any
+            of the passed strings. If this is not specified, modules will be chosen according to the model
+            architecture.
         modules_to_save (`Optional[List[str]]`):
-            List of modules apart from Supertuning layers to be set as trainable and saved in the final
-            checkpoint.
+            List of modules apart from Supertuning layers to be set as trainable and saved in the final checkpoint.
         sparsity (`float`):
             The target sparsity ratio (0.0 to 1.0). For example, 0.5 means 50% of parameters will be trainable.
             Defaults to 0.5.
         calibration_samples (`int`):
-            Number of samples to use for the calibration pass to compute activation-aware saliency scores.
-            Defaults to 32.
+            Number of samples to use for the calibration pass to compute activation-aware saliency scores. Defaults to
+            32.
         scoring_method (`str`):
-            The method to use for computing saliency scores. Can be "wanda" (activation-weighted magnitude)
-            or "magnitude" (magnitude-only, similar to PaFi). Defaults to "wanda".
+            The method to use for computing saliency scores. Can be "wanda" (activation-weighted magnitude) or
+            "magnitude" (magnitude-only, similar to PaFi). Defaults to "wanda".
         init_weights (`bool`):
-            Whether to initialize the trainable sparse values to zero (an identity update) during setup.
-            Defaults to `True`.
+            Whether to initialize the trainable sparse values to zero (an identity update) during setup. Defaults to
+            `True`.
 
     Paper: https://arxiv.org/abs/2607.09287
     """
