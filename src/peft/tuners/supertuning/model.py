@@ -2,7 +2,7 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-# You may obtain a a copy of the License at
+# You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -156,6 +156,7 @@ class SupertuningModel(BaseTuner):
                         if active_adapter == adapter_name:
                             # Store activation for later use
                             module._activation_stats[active_adapter] = input[0].detach()
+
             return hook
 
         # Register forward hooks to capture activations

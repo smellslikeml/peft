@@ -87,9 +87,7 @@ class SupertuningConfig(PeftConfig):
     )
     calibration_samples: int = field(
         default=32,
-        metadata={
-            "help": "Number of calibration samples to compute activation-aware saliency scores."
-        },
+        metadata={"help": "Number of calibration samples to compute activation-aware saliency scores."},
     )
     scoring_method: str = field(
         default="wanda",
