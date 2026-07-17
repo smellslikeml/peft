@@ -1,0 +1,72 @@
+name: Outrider Moonshot refine smoke (peft)
+
+# Second refinement smoke — validates the shipped stack on a different
+# fork (peft) with a different candidate. Exercises:
+#   - `provider: moonshot` action input (v1.7.29+)
+#   - Bot-token TTL fix (v1.7.31)
+#   - Research phase inherits claude-timeout (v1.7.32)
+#   - fidelity_skipped_* now continues to convention + test (v1.7.33)
+#
+# Manual-only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pick-override:
+        description: 'Drafter branch to refine.'
+        required: false
+        default: 'super-tuning-from-activation-aware-pruning-to-sparse-fine-tu'
+      pin-arxiv:
+        description: 'arxiv_id (bypasses selection).'
+        required: false
+        default: '2607.09287v1'
+
+concurrency:
+  group: outrider-moonshot-refine-smoke
+  cancel-in-progress: false
+
+jobs:
+  refine:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: remyxai/outrider@v1
+        env:
+          REMYX_API_KEY: ${{ secrets.REMYX_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+        with:
+          interest-id: 0ca0c752-ab5c-44b5-a097-42de9dc69fdd
+          mode: recommend
+          publish: pr
+          provider: moonshot
+          model: kimi-k3
+          pin-arxiv: ${{ inputs.pin-arxiv }}
+          start-from-ref: ${{ inputs.pick-override }}
+          lead-content: |
+            REFINEMENT PASS on an existing drafter branch.
+
+            Read the existing changes on this branch (SPEC.md if present,
+            plus the actual code changes), compare against the paper
+            (arxiv:2607.09287v1 — Super-Tuning: From Activation-Aware Pruning
+            to Sparse Fine-Tuning), and refine the implementation to better
+            match the paper's mechanism.
+
+            Focus on MECHANISM-LEVEL divergences:
+              - Wrong math or update rule
+              - Missing paper rules (activation-aware masking, layer selection
+                criteria, sparsity schedule, etc.)
+              - Invented behaviors not in the paper
+              - Category errors (misapplying the mechanism to the wrong
+                subsystem — this repo is peft, so the natural landing
+                surface is a new tuner class alongside LoRA, IA3, etc.)
+
+            Not stylistic polish. If the branch is already faithful, verify
+            with focused pytest additions rather than restructuring.
+          staged-synthesis: 'true'
+          claude-timeout: '3600'
+          rate-limit-days: '0'
