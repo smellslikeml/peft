@@ -20,6 +20,12 @@ import os
 import pandas as pd
 
 
+try:
+    from .retention_locality import LOCALITY_SCORE_COLUMN, add_locality_scores
+except ImportError:  # when imported as a top-level module (e.g. by the Gradio app)
+    from retention_locality import LOCALITY_SCORE_COLUMN, add_locality_scores
+
+
 _COMMON_METRIC_PREFERENCES = {
     "accelerator_memory_reserved_avg": "lower",
     "accelerator_memory_max": "lower",
@@ -35,10 +41,12 @@ _TASK_METRIC_PREFERENCES = {
     "MetaMathQA": {
         "test_accuracy": "higher",
         "forgetting*": "lower",
+        LOCALITY_SCORE_COLUMN: "higher",
     },
     "image-gen": {
         "test_dino_similarity": "higher",
         "drift*": "lower",
+        LOCALITY_SCORE_COLUMN: "higher",
     },
 }
 
@@ -197,11 +205,13 @@ _TASK_DTYPES = {
         "test_accuracy": float,
         "train_total_tokens": int,
         "forgetting*": float,
+        LOCALITY_SCORE_COLUMN: float,
         "bitsandbytes_version": "string",
     },
     "image-gen": {
         "test_dino_similarity": float,
         "drift*": float,
+        LOCALITY_SCORE_COLUMN: float,
         "diffusers_version": "string",
     },
 }
@@ -222,6 +232,7 @@ _TASK_IMPORTANT_COLUMNS = {
         "created_at",
         "task_name",
         "forgetting*",
+        LOCALITY_SCORE_COLUMN,
     ],
     "image-gen": [
         "experiment_name",
@@ -238,6 +249,7 @@ _TASK_IMPORTANT_COLUMNS = {
         "file_size",
         "created_at",
         "task_name",
+        LOCALITY_SCORE_COLUMN,
     ],
 }
 
@@ -262,6 +274,8 @@ def load_df(path, task_name, print_fn=print):
     if not preprocessed:
         return pd.DataFrame(columns=dtype_dict.keys())
     df = pd.DataFrame(preprocessed)
+    # rank runs by how localized / retention-preserving their adaptation is (NSRU)
+    df = add_locality_scores(df, task_name)
     df = df.astype(dtype_dict)
     df["created_at"] = pd.to_datetime(df["created_at"])
     # round training time to nearest second
