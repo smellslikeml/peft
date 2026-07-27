@@ -1,0 +1,17 @@
+{
+  "auto_mapping": null,
+  "base_model_name_or_path": null,
+  "inference_mode": false,
+  "init_weights": true,
+  "lora_alpha": 64,
+  "lora_dropout": 0.0,
+  "lora_ratio": 0.8,
+  "modules_to_save": null,
+  "peft_type": "SUPRA",
+  "r": 32,
+  "revision": null,
+  "scoring_method": "magnitude",
+  "selection_direction": "bottom",
+  "target_modules": null,
+  "task_type": "CAUSAL_LM"
+}
