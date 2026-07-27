@@ -7,15 +7,21 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Supra: hybrid sparse + low-rank fine-tuning (arXiv:2607.09287)."""
 
-from peft.tuners.supra.config import SupraConfig
-from peft.tuners.supra.layer import Linear, SupraLayer
-from peft.tuners.supra.mask import bottomk_magnitude_indices, compute_supra_budget
+from peft.utils import register_peft_method
+
+from .config import SupraConfig
+from .layer import Linear, SupraLayer
+from .mask import bottomk_magnitude_indices, compute_supra_budget
+from .model import SupraModel
 
 
 __all__ = [
     "Linear",
     "SupraConfig",
     "SupraLayer",
+    "SupraModel",
     "bottomk_magnitude_indices",
     "compute_supra_budget",
 ]
+
+register_peft_method(name="supra", config_cls=SupraConfig, model_cls=SupraModel, is_mixed_compatible=False)

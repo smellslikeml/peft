@@ -64,6 +64,7 @@ from .randlora import RandLoraConfig, RandLoraModel
 from .road import RoadConfig, RoadModel
 from .shira import ShiraConfig, ShiraModel
 from .supertuning import SupertuningConfig, SupertuningModel
+from .supra import SupraConfig, SupraModel
 from .tinylora import TinyLoraConfig, TinyLoraModel
 from .trainable_tokens import TrainableTokensConfig, TrainableTokensModel
 from .vblora import VBLoRAConfig, VBLoRAModel
@@ -152,6 +153,8 @@ __all__ = [
     "ShiraModel",
     "SupertuningConfig",
     "SupertuningModel",
+    "SupraConfig",
+    "SupraModel",
     "TinyLoraConfig",
     "TinyLoraModel",
     "TrainableTokensConfig",
