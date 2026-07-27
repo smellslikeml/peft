@@ -519,10 +519,23 @@ def get_dataset_info(dataset_id: str) -> Optional[huggingface_hub.DatasetInfo]:
 
 
 def get_git_hash(module) -> Optional[str]:
-    if "site-packages" in module.__path__[0]:
+    module_path = module.__path__[0]
+    # Cover both CPython (`site-packages`) and Debian/Colab (`dist-packages`) install layouts.
+    if "site-packages" in module_path or "dist-packages" in module_path:
         return None
-
-    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=os.path.dirname(module.__file__)).decode().strip()
+    try:
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=os.path.dirname(module.__file__),
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # Not a git checkout (e.g. installed from a wheel into a non-standard location).
+        return None
 
 
 def get_package_info() -> dict[str, Optional[str]]:
