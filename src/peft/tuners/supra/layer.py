@@ -19,9 +19,11 @@ import warnings
 from typing import Any, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from peft.tuners._buffer_dict import BufferDict
+from peft.tuners.supertuning.layer import DensePlusSparseLinear
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 
 from .config import SupraConfig
@@ -253,31 +255,32 @@ class Linear(nn.Module, SupraLayer):
         if not active_adapters:
             return self.base_layer(x, *args, **kwargs)
 
-        # Start from the frozen base output — same GEMM path as vanilla nn.Linear, so it hits cuBLAS's
-        # standard bf16 path on Turing. Sparse and LoRA contributions are then added on top.
-        result = self.base_layer(x, *args, **kwargs)
+        base_layer = self.get_base_layer()
+        weight = base_layer.weight
+        bias = base_layer.bias
 
-        in_features = self.in_features
-        for adapter_name in active_adapters:
-            # --- sparse contribution ---
-            # Instead of materializing a fresh (out, in) fused weight and re-running the full GEMM (which
-            # hits a T4/bf16 cuBLAS execution-failed path on freshly-allocated tensors), express the sparse
-            # update as an output-space contribution:
-            #     result[..., row_k] += x[..., col_k] * values_k
-            # for each (row_k, col_k) in the sparse support. Since sparse_k << in*out, this is far cheaper
-            # in FLOPs and memory than the fused-weight route.
-            values = self.supra_sparse_values[adapter_name]
-            if values.numel() > 0:
+        # Fuse the sparse update into a fresh (out, in) weight and re-run the GEMM. Cheaper on activation
+        # memory than an output-space additive path — the fused weight is ~out*in dtype-bytes per layer and
+        # only ``input`` needs to be saved for backward, whereas an additive path would cache a
+        # (batch, seq, sparse_k) tensor per layer that can dominate peak memory at large sparse_k.
+        # Single-adapter path uses the custom autograd Function so grad routes only to values (base weight
+        # stays frozen); multi-adapter case falls back to plain scatter_add over the raw weight.
+        if len(active_adapters) == 1:
+            adapter_name = active_adapters[0]
+            result = DensePlusSparseLinear.apply(
+                x, weight, self.supra_indices[adapter_name], self.supra_sparse_values[adapter_name], bias
+            )
+        else:
+            dense_plus_sparse = weight.reshape(-1)
+            for adapter_name in active_adapters:
                 indices = self.supra_indices[adapter_name].to(torch.int64)
-                i_row = torch.div(indices, in_features, rounding_mode="floor")
-                i_col = indices - i_row * in_features
-                x_selected = x.index_select(-1, i_col).to(result.dtype)
-                contrib = x_selected * values.to(result.dtype)
-                index_shape = list(contrib.shape)
-                i_row_broadcast = i_row.expand(*index_shape)
-                result = result.scatter_add(-1, i_row_broadcast, contrib)
+                values = self.supra_sparse_values[adapter_name].to(weight.dtype)
+                dense_plus_sparse = dense_plus_sparse.scatter_add(0, indices, values)
+            dense_plus_sparse = dense_plus_sparse.reshape_as(weight)
+            result = F.linear(x, dense_plus_sparse, bias)
 
-            # --- LoRA contribution ---
+        # LoRA contribution — one per adapter, added on top.
+        for adapter_name in active_adapters:
             if adapter_name not in self.supra_lora_A:
                 continue  # pure-Super for this adapter
             A = self.supra_lora_A[adapter_name]
