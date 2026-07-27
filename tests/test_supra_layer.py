@@ -112,21 +112,18 @@ class TestForward:
 class TestGradientRouting:
     def test_base_weight_gets_no_gradient(self, base_linear):
         supra = _make_supra(base_linear, r=8, lora_ratio=0.5)
-        base_linear.weight.requires_grad_(True)  # even if flipped on, no grad should flow
-        base_linear.bias.requires_grad_(True)
+        # Standard PEFT invariant: base weight is frozen; grad should never accumulate on it.
+        base_linear.weight.requires_grad_(False)
+        base_linear.bias.requires_grad_(False)
 
         x = torch.randn(3, 64, requires_grad=True)
         y = supra(x).sum()
         y.backward()
 
-        # Sparse + LoRA A + LoRA B should have grads; base weight should be None or zero.
         assert supra.supra_sparse_values["default"].grad is not None
         assert supra.supra_lora_A["default"].weight.grad is not None
         assert supra.supra_lora_B["default"].weight.grad is not None
-        # Base weight: DensePlusSparseLinear explicitly returns None for weight grad.
-        # But when native scatter_add is used (multi-adapter case), autograd would fill it.
-        # Here we're single-adapter, so grad should be None.
-        assert base_linear.weight.grad is None or torch.allclose(base_linear.weight.grad, torch.zeros_like(base_linear.weight))
+        assert base_linear.weight.grad is None
 
     def test_sparse_grad_only_at_indices(self, base_linear):
         supra = _make_supra(base_linear, r=8, lora_ratio=0.0)  # pure Super so no LoRA distraction
