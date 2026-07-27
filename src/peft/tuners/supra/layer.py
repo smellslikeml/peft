@@ -147,6 +147,23 @@ class SupraLayer(BaseTunerLayer):
         self._move_adapter_to_device_of_base_layer(adapter_name)
         self.set_adapter(self.active_adapters, inference_mode=config.inference_mode)
 
+    def _move_adapter_to_device_of_base_layer(self, adapter_name: str, device: Optional[torch.device] = None) -> None:
+        """
+        Move the adapter to the base layer's device, but preserve integer dtype of `supra_indices`.
+
+        PEFT's default helper unconditionally casts every adapter tensor to the base layer's floating dtype. For our
+        integer indices buffer that is silently destructive when the base is bf16: bf16 has an 8-bit mantissa, so any
+        index > 256 is rounded, and when we cast back to int64 for scatter the resulting value is out-of-bounds and
+        trips the CUDA scatter-gather assertion. Snapshot the indices, delegate to the parent, then restore.
+        """
+        snapshot = None
+        if adapter_name in self.supra_indices:
+            snapshot = self.supra_indices[adapter_name].detach().clone()
+        super()._move_adapter_to_device_of_base_layer(adapter_name, device)
+        if snapshot is not None:
+            target_device = device if device is not None else self.get_base_layer().weight.device
+            self.supra_indices[adapter_name] = snapshot.to(target_device)
+
 
 class Linear(nn.Module, SupraLayer):
     """

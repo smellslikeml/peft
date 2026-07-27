@@ -171,6 +171,30 @@ class TestMergeUnmerge:
 # --- config validation ------------------------------------------------------
 
 
+class TestDtypePreservation:
+    """
+    Regression: PEFT's `_move_adapter_to_device_of_base_layer` casts every adapter tensor to the base layer's
+    floating dtype. Applied to our integer indices under a bf16 base, indices > 256 round destructively — leading to
+    out-of-bounds scatter indices on the CUDA scatter kernel. Our SupraLayer override must preserve the int dtype.
+    """
+
+    def test_indices_stay_int32_when_base_is_bf16(self, base_linear):
+        supra = _make_supra(base_linear, r=8, lora_ratio=0.5)
+        # Cast base to bf16 to trigger the bug PEFT's helper would otherwise cause.
+        base_linear.to(torch.bfloat16)
+        supra._move_adapter_to_device_of_base_layer("default")
+        assert supra.supra_indices["default"].dtype == torch.int32, \
+            f"indices dtype was cast away from int32: {supra.supra_indices['default'].dtype}"
+
+    def test_index_values_unchanged_after_move_when_base_is_bf16(self, base_linear):
+        supra = _make_supra(base_linear, r=8, lora_ratio=0.5)
+        before = supra.supra_indices["default"].detach().clone()
+        base_linear.to(torch.bfloat16)
+        supra._move_adapter_to_device_of_base_layer("default")
+        after = supra.supra_indices["default"]
+        assert torch.equal(before, after), "index values were corrupted by base dtype cast"
+
+
 class TestConfig:
     def test_rejects_bad_lora_ratio(self):
         with pytest.raises(ValueError, match="lora_ratio"):
