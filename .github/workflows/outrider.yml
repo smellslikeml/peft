@@ -96,7 +96,6 @@ jobs:
           interest-id: 0ca0c752-ab5c-44b5-a097-42de9dc69fdd
           mode: ${{ inputs.mode || '' }}
           pr-number: ${{ inputs.pr-number || '' }}
-          model-base-url: ${{ inputs.base-url || '' }}
           rate-limit-days: '0'
           search-method: ${{ inputs.search-method || '' }}
           pin-arxiv: ${{ inputs.pin-arxiv || '' }}
@@ -106,4 +105,6 @@ jobs:
           publish: ${{ inputs.publish || 'branch' }}
           staged-synthesis: ${{ inputs.staged-synthesis || 'false' }}
           maintain-state: ${{ inputs.maintain-state || 'true' }}
-          model-base-url: ${{ (inputs.provider || 'zai') == 'zai' && 'https://api.z.ai/api/anthropic' || '' }}
+          # Explicit base-url input wins; otherwise fall back to the zai default
+          # (matches remyxai/outrider@v1's own workflow pattern).
+          model-base-url: ${{ inputs.base-url != '' && inputs.base-url || ((inputs.provider || 'zai') == 'zai' && 'https://api.z.ai/api/anthropic' || '') }}
