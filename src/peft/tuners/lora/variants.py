@@ -29,10 +29,47 @@ from peft.utils.other import transpose
 
 from .arrow import ArrowLoraLinearLayer
 from .config import LoraConfig, PeftConfig
-from .dora import DoraConv1dLayer, DoraConv2dLayer, DoraConv3dLayer, DoraEmbeddingLayer, DoraLinearLayer
+from .dora import (
+    USE_FACTORED_DORA_KERNEL,
+    DoraConv1dLayer,
+    DoraConv2dLayer,
+    DoraConv3dLayer,
+    DoraEmbeddingLayer,
+    DoraLinearLayer,
+)
 from .layer import Conv1d, Conv2d, Conv3d, Embedding, Linear, LoraLayer, LoraVariant, _ConvNd
 from .monteclora import MontecloraSampler
 from .velora import VeloraFunction, _get_group_dim, _normalize_projection, _reshape_to_grouped_subtokens
+
+
+# Lazy load of the fused DoRA kernel from HF Hub. The optional `kernels` library is only imported when
+# USE_FACTORED_DORA_KERNEL is set. On first call the kernel is downloaded from remyxai/dora-factored-kernel
+# (Apache-2.0) and cached in ~/.cache/huggingface/hub/; subsequent calls hit the cache. When the library
+# or a compatible CUDA + Triton runtime isn't present, `_get_dora_kernel()` returns None and the flag is a
+# no-op — behavior is identical to the existing dense path.
+_DORA_KERNEL = None
+_DORA_KERNEL_LOAD_ATTEMPTED = False
+
+
+def _get_dora_kernel():
+    global _DORA_KERNEL, _DORA_KERNEL_LOAD_ATTEMPTED
+    if _DORA_KERNEL_LOAD_ATTEMPTED:
+        return _DORA_KERNEL
+    _DORA_KERNEL_LOAD_ATTEMPTED = True
+    try:
+        from kernels import get_kernel
+
+        # trust_remote_code=True is required because the kernel is under a non-huggingface namespace.
+        # Users opting in via USE_FACTORED_DORA_KERNEL have already accepted this by flipping the flag.
+        _DORA_KERNEL = get_kernel(
+            "remyxai/dora-factored-kernel",
+            version=1,
+            trust_remote_code=True,
+        )
+    except Exception:
+        # ImportError (kernels not installed) or any Hub-side load failure — silently fall back.
+        _DORA_KERNEL = None
+    return _DORA_KERNEL
 
 
 class ArrowLinearVariant(LoraVariant):
@@ -181,6 +218,22 @@ class DoraLinearVariant(LoraVariant):
         # cannot calculate it on the fly based on the merged weights when unmerging because its a
         # different value
         module._cache_store(f"{active_adapter}-weight_norm", weight_norm)
+
+        dora_kernel = _get_dora_kernel() if USE_FACTORED_DORA_KERNEL else None
+        if dora_kernel is not None and dora_kernel._triton_available(orig_weight):
+            # Fused Triton path: the kernel computes (dora_scale / ||W + s·BA||) ⊙ (W + s·BA) directly,
+            # equivalent to the dense expression below within fp32 accumulation tolerance.
+            lora_A = module.lora_A[active_adapter].weight
+            lora_B = module.lora_B[active_adapter].weight
+            scaling = module.scaling[active_adapter]
+            dora_scale = module.lora_magnitude_vector[active_adapter].weight
+            new_weight = dora_kernel.dora_factored_forward(
+                transpose(orig_weight, module.fan_in_fan_out), lora_A, lora_B, scaling, dora_scale
+            )
+            new_weight = transpose(new_weight, module.fan_in_fan_out).to(orig_dtype)
+            return new_weight
+
+        # Dense path
         dora_factor = module.lora_magnitude_vector[active_adapter].weight / weight_norm
         dora_factor = transpose(dora_factor.view(-1, 1), module.fan_in_fan_out)
         new_weight = dora_factor * (orig_weight + delta_weight)
@@ -200,6 +253,21 @@ class DoraLinearVariant(LoraVariant):
         # cannot calculate it on the fly based on the merged weights when unmerging because its a
         # different value
         module._cache_store(f"{active_adapter}-weight_norm", weight_norm)
+
+        dora_kernel = _get_dora_kernel() if USE_FACTORED_DORA_KERNEL else None
+        if dora_kernel is not None and dora_kernel._triton_available(orig_weight):
+            # Fused Triton path — same math as merge_safe, writing back in place.
+            lora_A = module.lora_A[active_adapter].weight
+            lora_B = module.lora_B[active_adapter].weight
+            scaling = module.scaling[active_adapter]
+            dora_scale = module.lora_magnitude_vector[active_adapter].weight
+            new_weight = dora_kernel.dora_factored_forward(
+                transpose(orig_weight.data, module.fan_in_fan_out), lora_A, lora_B, scaling, dora_scale
+            )
+            orig_weight.data = transpose(new_weight, module.fan_in_fan_out).to(orig_dtype)
+            return
+
+        # Dense path
         dora_factor = module.lora_magnitude_vector[active_adapter].weight / weight_norm
         dora_factor = transpose(dora_factor.view(-1, 1), module.fan_in_fan_out)
         new_weight = dora_factor * (orig_weight.data + delta_weight)
