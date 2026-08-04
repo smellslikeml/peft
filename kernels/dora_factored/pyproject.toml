@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dora-factored-kernel"
+version = "0.1.0"
+description = "DoRA-factored kernel: PyTorch reference (Stage A) of the factored-norm DoRA weight forward (arXiv:2603.22276)."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    { name = "HuggingFace Inc. team" },
+]
+keywords = ["peft", "dora", "lora", "kernel", "factored-norm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Standalone package: depends on torch only. Explicitly NO peft / transformers runtime dep.
+dependencies = [
+    "torch",
+]
+
+[project.urls]
+Homepage = "https://github.com/smellslikeml/peft"
+Paper = "https://arxiv.org/abs/2603.22276"
+Upstream-PR = "https://github.com/huggingface/peft/pull/3382"
+
+# The importable `dora_factored` package lives under torch-ext/ (kernels-library layout).
+[tool.setuptools]
+package-dir = { "" = "torch-ext" }
+
+[tool.setuptools.packages.find]
+where = ["torch-ext"]
+
+# Self-contained test config so `pytest tests/` works from this package without inheriting the
+# PEFT repo-root addopts (notably `--cov=src/peft`, which needs pytest-cov and is meaningless for a
+# peft-free standalone package). pytest treats this pyproject as the ini only because this section
+# exists; otherwise it walks up to the repo root.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
