@@ -122,6 +122,10 @@ def test_dora_kernel_merge_with_factored_norm_enabled():
     )
     model = get_peft_model(model, config).eval()
 
+    # Snapshot adapter state BEFORE any merge — merge_and_unload strips the LoRA/DoRA modules,
+    # leaving a bare base layer whose state_dict can't be loaded into a fresh PeftModel.
+    state = {k: v.clone() for k, v in model.state_dict().items()}
+
     # Merge with the fused kernel
     with torch.inference_mode():
         w_kernel = model.merge_and_unload().linear.weight.data.clone()
@@ -130,7 +134,7 @@ def test_dora_kernel_merge_with_factored_norm_enabled():
     dora_module.USE_FACTORED_DORA_NORM = False
     dora_module.USE_FACTORED_DORA_KERNEL = False
     model_dense = get_peft_model(MyModule().eval().to("cuda"), config).eval()
-    model_dense.load_state_dict(model.state_dict())
+    model_dense.load_state_dict(state)
     with torch.inference_mode():
         w_dense = model_dense.merge_and_unload().linear.weight.data.clone()
 
@@ -170,6 +174,10 @@ def test_dora_kernel_merge_multiple_adapters():
     )
     model.add_adapter("adapter2", config2)
 
+    # Snapshot state BEFORE merging so we can rehydrate the dense-path comparator with the same
+    # (multi-adapter) initialization. merge_and_unload strips adapter modules from `model`.
+    state = {k: v.clone() for k, v in model.state_dict().items()}
+
     # Merge the first adapter with the kernel
     with torch.inference_mode():
         w_kernel = model.merge_and_unload().linear.weight.data.clone()
@@ -177,8 +185,8 @@ def test_dora_kernel_merge_multiple_adapters():
     # Compare with the dense path
     dora_module.USE_FACTORED_DORA_KERNEL = False
     model_dense = get_peft_model(MyModule().eval().to("cuda"), config).eval()
-    model_dense.load_state_dict(model.state_dict())
     model_dense.add_adapter("adapter2", config2)
+    model_dense.load_state_dict(state)
     with torch.inference_mode():
         w_dense = model_dense.merge_and_unload().linear.weight.data.clone()
 
