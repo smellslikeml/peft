@@ -35,6 +35,18 @@ on:
         description: 'Optional hand-crafted implementation spec (landing-zone-to-PR mode). Overrides suggested_experiment.'
         required: false
         default: ''
+      mode:
+        description: 'Run mode. recommend (default) runs the ranker+paper flow; brief runs the paper-less lead-content-only flow; convention/fidelity/test run the corresponding refinement pass on an open PR.'
+        required: false
+        default: ''
+      pr-number:
+        description: 'PR number to audit — required by mode=convention / fidelity / test refinement passes.'
+        required: false
+        default: ''
+      base-url:
+        description: 'Optional Anthropic-compatible endpoint (self-hosted model, litellm proxy, vLLM Anthropic shim). Overrides the per-provider default when set.'
+        required: false
+        default: ''
       start-from-ref:
         description: 'Optional branch/tag/SHA to start the coding session from.'
         required: false
@@ -82,6 +94,9 @@ jobs:
       - uses: remyxai/outrider@v1
         with:
           interest-id: 0ca0c752-ab5c-44b5-a097-42de9dc69fdd
+          mode: ${{ inputs.mode || '' }}
+          pr-number: ${{ inputs.pr-number || '' }}
+          model-base-url: ${{ inputs.base-url || '' }}
           rate-limit-days: '0'
           search-method: ${{ inputs.search-method || '' }}
           pin-arxiv: ${{ inputs.pin-arxiv || '' }}
