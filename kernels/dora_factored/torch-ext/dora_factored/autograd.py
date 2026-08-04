@@ -43,7 +43,7 @@ import torch
 
 from .reference import _factored_weight_norm
 from .triton_backward import dora_backward
-from .triton_compose import dora_compose
+from .triton_compose_strided import dora_compose_strided
 
 
 # Coefficient the ported compose/backward kernels bake onto their `lora` input (see
@@ -70,13 +70,16 @@ class DoraFactoredFn(torch.autograd.Function):
 
         # The kernel applies `mag` per column (num_cols). PEFT's magnitude is per output feature
         # (d_out), so feed the transposed weight [d_in, d_out] to line num_cols up with mag.
-        # TODO(stage-c): these three `.t().contiguous()` calls each materialize a full [d_out, d_in]
-        # tensor. On A100 at 4K×4K fp32 they add ~250µs, which swallows the fusion's ~170µs saving —
-        # the fast-path currently runs ~0.47× the reference. Fix at the PEFT-loader boundary by
-        # storing the transposed base_weight once at load time and letting the fused kernel accept
-        # explicit strides (the backward kernel already does).
-        compose_k = dora_compose(lora_in.t().contiguous(), base_weight.t().contiguous(), mag)
-        compose_delta = compose_k.t().contiguous()  # back to [d_out, d_in]
+        # Stage C fix: the strided kernel accepts explicit strides, so we pass zero-cost .t() views
+        # instead of materializing .t().contiguous() copies. Allocate output once and write into
+        # its transposed view.
+        out = torch.empty_like(base_weight)
+        compose_delta = dora_compose_strided(
+            lora_in.t(),  # [d_in, d_out] view, stride-aware
+            base_weight.t(),  # [d_in, d_out] view, stride-aware
+            mag,
+            out=out.t(),  # Write directly into transposed view of output
+        ).t()  # View back to [d_out, d_in] — zero-cost
         out = base_weight + compose_delta
 
         # Adapted weight = base + 0.7·lora_in = W + s·BA, consumed by the backward kernel as `inner`.
@@ -95,19 +98,20 @@ class DoraFactoredFn(torch.autograd.Function):
         d_in = base_weight.shape[1]  # num_rows in kernel orientation (weight is [d_out, d_in])
 
         # Kernel orientation [num_rows=d_in, num_cols=d_out]; grad_output and inner are [d_out, d_in].
-        packed = dora_backward(grad_output.t().contiguous(), inner.t().contiguous(), mag)
+        # Stage C fix: pass zero-cost .t() views instead of materializing .t().contiguous() copies.
+        packed = dora_backward(grad_output.t(), inner.t(), mag)
         grad_lora_k = packed[0:d_in]    # [d_in, d_out] — grad w.r.t. the (pre-folded) lora input
         grad_base_k = packed[d_in : 2 * d_in]  # [d_in, d_out] — grad w.r.t. base, compose_delta path
         grad_mag = packed[2 * d_in]     # [d_out]
 
         # Undo the scaling/0.7 fold, then chain the matmul backward into lora_a / lora_b.
-        grad_delta = (scaling / _KERNEL_LORA_COEFF) * grad_lora_k.t().contiguous()  # [d_out, d_in]
+        grad_delta = (scaling / _KERNEL_LORA_COEFF) * grad_lora_k.t()  # [d_out, d_in] — zero-cost view
         grad_lora_b = grad_delta @ lora_a.transpose(-2, -1)
         grad_lora_a = lora_b.transpose(-2, -1) @ grad_delta
 
         # out = base + compose_delta ⇒ grad w.r.t. base picks up the explicit +base term (grad_output)
         # on top of the kernel's compose_delta-path grad_base.
-        grad_base_weight = grad_output + grad_base_k.t().contiguous()
+        grad_base_weight = grad_output + grad_base_k.t()  # [d_out, d_in] — zero-cost view
 
         # mag = dora_scale / weight_norm (weight_norm detached) ⇒ grad_dora_scale = grad_mag / weight_norm.
         if not ctx.dora_scale_is_tensor:

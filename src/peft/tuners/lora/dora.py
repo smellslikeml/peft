@@ -38,6 +38,20 @@ DoRA at the cost of a slightly different floating-point accumulation order. See 
 default to preserve the exact numerics of the existing implementation.
 """
 
+USE_FACTORED_DORA_KERNEL = False
+"""Whether to use the fused Triton kernel for DoRA weight merge operations.
+
+When both ``USE_FACTORED_DORA_KERNEL`` and ``USE_FACTORED_DORA_NORM`` are ``True`` and CUDA + Triton are available,
+``DoraLinearVariant.merge_safe`` and ``merge_unsafe`` compute the merged DoRA weight via the fused Triton kernel
+from the ``dora_factored`` package (see ``kernels/dora_factored/``). Otherwise, the existing dense path is used
+unchanged.
+
+The two flags are orthogonal: ``USE_FACTORED_DORA_NORM`` controls the factored-norm math (upstream
+huggingface/peft#3382), while ``USE_FACTORED_DORA_KERNEL`` controls whether the *materialize* path (merge/unmerge)
+uses the fused kernel. The runtime forward path (``DoraLinearLayer.forward``) is unaffected — it applies the DoRA
+rescale to activations and never materializes the full ``[d_out, d_in]`` weight.
+"""
+
 
 def cache_decorator(cache_key: str):
     """Caching decorator for DoRA
