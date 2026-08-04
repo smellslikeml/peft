@@ -113,11 +113,18 @@ kernels/dora_factored/
   `kernels.get_kernel(...)`; extract via `git subtree split --prefix=kernels/dora_factored` for the
   Hub publish and shepherd upstream to `huggingface/peft`.
 
-## Stage B — fused Triton fast-path (this change)
+## Stage B — fused Triton path (this change)
 
-> Supersedes the *Status* note above for the fast path: `dora_factored_forward(...)` now auto-dispatches
-> to a fused Triton kernel on CUDA and still falls back to the Stage A PyTorch reference on CPU / when
-> `triton` is absent. The signature is unchanged (no `use_triton=` kwarg); callers keep one import.
+> Supersedes the *Status* note above: `dora_factored_forward(...)` now auto-dispatches to a fused
+> Triton kernel on CUDA and still falls back to the Stage A PyTorch reference on CPU / when `triton`
+> is absent. The signature is unchanged (no `use_triton=` kwarg); callers keep one import.
+>
+> **Perf status:** correctness-validated on A100 + T4 (90/90 parity tests across fp16/bf16/fp32 × 6
+> tile-boundary shapes × 3 scalings, forward + backward). **Not yet a perf win at the ~4K×4K shape**
+> — the wrapper's `.t().contiguous()` calls needed to line the port up with PEFT's `[d_out, d_in]`
+> orientation cost more than the fusion saves. The perf-tuning fix lives at the PEFT-loader boundary
+> (Stage C) where the frozen base weight can be transposed once at load time and the kernel can
+> accept explicit strides — see the TODO in `autograd.py`.
 
 The compose (forward) and backward kernels are ported **verbatim** from the paper's reference
 implementation at `sockeye44/dorafactors/code/kernelagent_sols/` (`optimize_dora_compose/...` and

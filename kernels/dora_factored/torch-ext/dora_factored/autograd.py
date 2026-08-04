@@ -70,6 +70,11 @@ class DoraFactoredFn(torch.autograd.Function):
 
         # The kernel applies `mag` per column (num_cols). PEFT's magnitude is per output feature
         # (d_out), so feed the transposed weight [d_in, d_out] to line num_cols up with mag.
+        # TODO(stage-c): these three `.t().contiguous()` calls each materialize a full [d_out, d_in]
+        # tensor. On A100 at 4K×4K fp32 they add ~250µs, which swallows the fusion's ~170µs saving —
+        # the fast-path currently runs ~0.47× the reference. Fix at the PEFT-loader boundary by
+        # storing the transposed base_weight once at load time and letting the fused kernel accept
+        # explicit strides (the backward kernel already does).
         compose_k = dora_compose(lora_in.t().contiguous(), base_weight.t().contiguous(), mag)
         compose_delta = compose_k.t().contiguous()  # back to [d_out, d_in]
         out = base_weight + compose_delta
