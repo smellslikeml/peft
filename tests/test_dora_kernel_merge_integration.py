@@ -48,7 +48,6 @@ def restore_flags():
     dora_module.USE_FACTORED_DORA_KERNEL = original_kernel
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
 def test_dora_kernel_merge_weights_match_dense_path():
     """End-to-end test: the fused kernel merge produces identical weights to the dense path.
 
@@ -99,7 +98,6 @@ def test_dora_kernel_merge_weights_match_dense_path():
     torch.testing.assert_close(w_kernel, w_dense, atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
 def test_dora_kernel_merge_with_factored_norm_enabled():
     """Test that the kernel works correctly when both flags are enabled.
 
@@ -146,7 +144,6 @@ def test_dora_kernel_merge_with_factored_norm_enabled():
     torch.testing.assert_close(w_kernel, w_dense, atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
 def test_dora_kernel_merge_multiple_adapters():
     """Test that the kernel merge works correctly with multiple DoRA adapters."""
     dora_module.USE_FACTORED_DORA_NORM = True

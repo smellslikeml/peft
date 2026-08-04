@@ -42,16 +42,19 @@ from .monteclora import MontecloraSampler
 from .velora import VeloraFunction, _get_group_dim, _normalize_projection, _reshape_to_grouped_subtokens
 
 
-# Lazy load of the fused DoRA kernel from HF Hub. The optional `kernels` library is only imported when
-# USE_FACTORED_DORA_KERNEL is set. On first call the kernel is downloaded from remyxai/dora-factored-kernel
-# (Apache-2.0) and cached in ~/.cache/huggingface/hub/; subsequent calls hit the cache. When the library
-# or a compatible CUDA + Triton runtime isn't present, `_get_dora_kernel()` returns None and the flag is a
-# no-op — behavior is identical to the existing dense path.
 _DORA_KERNEL = None
 _DORA_KERNEL_LOAD_ATTEMPTED = False
 
 
-def _get_dora_kernel():
+def _get_dora_kernel() -> Optional[Any]:
+    """Load the fused DoRA kernel from HF Hub, or return None if unavailable.
+
+    The optional ``kernels`` library is imported lazily on first call. When present, the kernel is
+    downloaded from ``remyxai/dora-factored-kernel`` (Apache-2.0) and cached in
+    ``~/.cache/huggingface/hub/``; subsequent calls hit the cache. When the library is missing or the
+    Hub load fails, returns ``None`` and ``USE_FACTORED_DORA_KERNEL`` becomes a no-op — behavior is
+    identical to the existing dense path.
+    """
     global _DORA_KERNEL, _DORA_KERNEL_LOAD_ATTEMPTED
     if _DORA_KERNEL_LOAD_ATTEMPTED:
         return _DORA_KERNEL
