@@ -42,8 +42,8 @@ import torch
 # reference" comparison would reduce to "reference vs reference". importorskip makes absence loud.
 pytest.importorskip("triton")
 
-from dora_factored import _triton_available, dora_factored_forward  # noqa: E402
-from dora_factored.reference import _factored_weight_norm, _forward_reference  # noqa: E402
+from dora_factored import _triton_available, dora_factored_forward
+from dora_factored.reference import _factored_weight_norm, _forward_reference
 
 
 pytestmark = [

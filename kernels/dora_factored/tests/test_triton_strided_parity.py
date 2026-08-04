@@ -30,8 +30,8 @@ import torch
 # Skip the whole module unless both CUDA and triton are present.
 pytest.importorskip("triton")
 
-from dora_factored.triton_compose_strided import dora_compose_strided  # noqa: E402
-from dora_factored.reference import _factored_weight_norm  # noqa: E402
+from dora_factored.reference import _factored_weight_norm
+from dora_factored.triton_compose_strided import dora_compose_strided
 
 
 pytestmark = [

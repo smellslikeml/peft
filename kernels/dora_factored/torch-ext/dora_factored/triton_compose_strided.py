@@ -174,9 +174,7 @@ def dora_compose_strided(
         assert out.dtype == lora.dtype
 
     def grid(META):
-        return (
-            triton.cdiv(num_rows, META["BLOCK_M"]) * triton.cdiv(num_cols, META["BLOCK_N"]),
-        )
+        return (triton.cdiv(num_rows, META["BLOCK_M"]) * triton.cdiv(num_cols, META["BLOCK_N"]),)
 
     _fused_dora_compose_strided_kernel[grid](
         lora,

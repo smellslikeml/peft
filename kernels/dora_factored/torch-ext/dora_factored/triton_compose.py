@@ -166,9 +166,7 @@ def dora_compose(
     out_2d = torch.empty_like(lora_2d)
 
     def grid(META):
-        return (
-            triton.cdiv(num_rows, META["BLOCK_M"]) * triton.cdiv(num_cols, META["BLOCK_N"]),
-        )
+        return (triton.cdiv(num_rows, META["BLOCK_M"]) * triton.cdiv(num_cols, META["BLOCK_N"]),)
 
     _fused_dora_compose_kernel[grid](
         lora_2d,

@@ -28,18 +28,28 @@ from peft.utils.other import transpose
 
 from .arrow import ArrowLoraLinearLayer
 from .config import LoraConfig, PeftConfig
-from .dora import DoraConv1dLayer, DoraConv2dLayer, DoraConv3dLayer, DoraEmbeddingLayer, DoraLinearLayer, USE_FACTORED_DORA_KERNEL
+from .dora import (
+    USE_FACTORED_DORA_KERNEL,
+    DoraConv1dLayer,
+    DoraConv2dLayer,
+    DoraConv3dLayer,
+    DoraEmbeddingLayer,
+    DoraLinearLayer,
+)
 from .layer import Conv1d, Conv2d, Conv3d, Embedding, Linear, LoraVariant, _ConvNd
 from .monteclora import MontecloraSampler
 from .velora import VeloraFunction, _get_group_dim, _normalize_projection, _reshape_to_grouped_subtokens
 
+
 # Guarded import for the DoRA factored kernel (Stage C). No hard dependency — if the package isn't
 # installed, USE_FACTORED_DORA_KERNEL is a no-op and behavior is identical to the existing dense path.
 try:
-    from dora_factored import dora_factored_forward, _triton_available
+    from dora_factored import _triton_available, dora_factored_forward
+
     _HAVE_DORA_FACTORED_KERNEL = True
 except ImportError:
     _HAVE_DORA_FACTORED_KERNEL = False
+
     # Define a dummy _triton_available for when the kernel isn't available
     def _triton_available(tensor):
         return False
@@ -182,11 +192,7 @@ class DoraLinearVariant(LoraVariant):
         delta_weight = module.get_delta_weight(active_adapter)
 
         # Check if we should use the fused DoRA kernel
-        if (
-            USE_FACTORED_DORA_KERNEL
-            and _HAVE_DORA_FACTORED_KERNEL
-            and _triton_available(orig_weight)
-        ):
+        if USE_FACTORED_DORA_KERNEL and _HAVE_DORA_FACTORED_KERNEL and _triton_available(orig_weight):
             # Use the fused Triton kernel from dora_factored package
             lora_A = module.lora_A[active_adapter].weight
             lora_B = module.lora_B[active_adapter].weight
@@ -229,11 +235,7 @@ class DoraLinearVariant(LoraVariant):
         delta_weight = module.get_delta_weight(active_adapter)
 
         # Check if we should use the fused DoRA kernel
-        if (
-            USE_FACTORED_DORA_KERNEL
-            and _HAVE_DORA_FACTORED_KERNEL
-            and _triton_available(orig_weight)
-        ):
+        if USE_FACTORED_DORA_KERNEL and _HAVE_DORA_FACTORED_KERNEL and _triton_available(orig_weight):
             # Use the fused Triton kernel from dora_factored package
             lora_A = module.lora_A[active_adapter].weight
             lora_B = module.lora_B[active_adapter].weight

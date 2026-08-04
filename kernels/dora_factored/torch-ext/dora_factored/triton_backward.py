@@ -230,8 +230,10 @@ def dora_backward(
 
     if c > 0:
         if num_partials > 0:
+
             def grid_stage1(META):
                 return (triton.cdiv(c, META["BLOCK_N"]), num_partials)
+
             _dora_backward_stage1_kernel[grid_stage1](
                 d_out,
                 inner,

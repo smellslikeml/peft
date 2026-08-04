@@ -91,9 +91,9 @@ class DoraFactoredFn(torch.autograd.Function):
         # Kernel orientation [num_rows=d_in, num_cols=d_out]; grad_output and inner are [d_out, d_in].
         # Stage C fix: pass zero-cost .t() views instead of materializing .t().contiguous() copies.
         packed = dora_backward(grad_output.t(), inner.t(), mag, lora_coeff=scaling)
-        grad_lora_k = packed[0:d_in]    # [d_in, d_out] — grad w.r.t. the (pre-folded) lora input
+        grad_lora_k = packed[0:d_in]  # [d_in, d_out] — grad w.r.t. the (pre-folded) lora input
         grad_base_k = packed[d_in : 2 * d_in]  # [d_in, d_out] — grad w.r.t. base, compose_delta path
-        grad_mag = packed[2 * d_in]     # [d_out]
+        grad_mag = packed[2 * d_in]  # [d_out]
 
         # Chain the matmul backward into lora_a / lora_b.
         grad_delta = grad_lora_k.t()  # [d_out, d_in] — zero-cost view

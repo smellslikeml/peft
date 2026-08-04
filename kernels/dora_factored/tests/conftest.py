@@ -24,6 +24,7 @@ Triton / no `kernels` install.
 import sys
 from pathlib import Path
 
+
 _TORCH_EXT = Path(__file__).resolve().parent.parent / "torch-ext"
 if str(_TORCH_EXT) not in sys.path:
     sys.path.insert(0, str(_TORCH_EXT))
