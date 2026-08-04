@@ -258,6 +258,20 @@ def get_peft_model_state_dict(
                     # the above may contain other adapter names, so filter again
                     to_return = _filter_state_dict_for_adapter_name(to_return, unwanted_adapter_names)
 
+    elif config.peft_type == PeftType.UNILORA:
+        theta_d_key = f"base_model.unilora_theta_d.{adapter_name}"
+        if theta_d_key not in state_dict:
+            raise KeyError(f"Expected UniLora parameter '{theta_d_key}' in the model state dict.")
+        to_return = {theta_d_key: state_dict[theta_d_key]}
+        if config.save_indices:
+            to_return.update(
+                {
+                    k: v
+                    for k, v in state_dict.items()
+                    if (("unilora_indices" in k or "unilora_scales" in k) and f".{adapter_name}" in k)
+                }
+            )
+
     elif config.peft_type == PeftType.VERA:
         vera_prefix = PEFT_TYPE_TO_PREFIX_MAPPING[config.peft_type]
         to_return = {k: state_dict[k] for k in state_dict if vera_prefix in k}
@@ -308,6 +322,23 @@ def get_peft_model_state_dict(
                 )
             to_return["base_model.pvera_A." + adapter_name] = state_dict["base_model.pvera_A." + adapter_name]
             to_return["base_model.pvera_B." + adapter_name] = state_dict["base_model.pvera_B." + adapter_name]
+    elif config.peft_type == PeftType.FROD:
+        frod_prefix = PEFT_TYPE_TO_PREFIX_MAPPING[config.peft_type]
+        projection_prefixes = ("base_model.frod_V.", "base_model.frod_s_indices.", "base_model.frod_s_size.")
+        layer_projection_parts = (".frod_V.", ".frod_s_indices.", ".frod_s_size.", ".frod_U.")
+        to_return = {
+            k: state_dict[k]
+            for k in state_dict
+            if (frod_prefix in k) and (adapter_name in k) and not any(part in k for part in layer_projection_parts)
+        }
+        if config.save_projection:
+            to_return.update(
+                {
+                    k: state_dict[k]
+                    for k in state_dict
+                    if k.startswith(projection_prefixes) and k.endswith(f".{adapter_name}")
+                }
+            )
     elif config.peft_type == PeftType.XLORA:
         to_return = {k: state_dict[k] for k in state_dict if "internal_xlora_classifier" in k}
     elif config.peft_type == PeftType.VBLORA:
@@ -758,6 +789,13 @@ def set_peft_model_state_dict(
                 new_key = k.replace(".tinylora_v.", f".tinylora_v.{adapter_name}.")
                 tinylora_v_state_dict[new_key] = state_dict.pop(k)
 
+        frod_projection_state_dict = {}
+        if config.peft_type == PeftType.FROD:
+            frod_projection_prefixes = ("base_model.frod_V.", "base_model.frod_s_indices.", "base_model.frod_s_size.")
+            frod_projection_keys = [k for k in state_dict if k.startswith(frod_projection_prefixes)]
+            for k in frod_projection_keys:
+                frod_projection_state_dict[f"{k}.{adapter_name}"] = state_dict.pop(k)
+
         peft_model_state_dict = _insert_adapter_name_into_state_dict(
             state_dict, adapter_name=adapter_name, parameter_prefix=parameter_prefix
         )
@@ -765,6 +803,8 @@ def set_peft_model_state_dict(
         # Add back the tinylora_v keys (now in the correct format)
         if config.peft_type == PeftType.TINYLORA:
             peft_model_state_dict.update(tinylora_v_state_dict)
+        elif config.peft_type == PeftType.FROD:
+            peft_model_state_dict.update(frod_projection_state_dict)
 
         if config.peft_type == PeftType.ADALORA:
             rank_pattern = config.rank_pattern
@@ -803,6 +843,17 @@ def set_peft_model_state_dict(
                     " PRNG initialisation to restore these projections using `config.projection_prng_key`, which may"
                     " not be accurate on all system configurations."
                 )
+
+            if "base_model.vera_A" in peft_model_state_dict:
+                # The projections are shared between the layers and stored on the model itself, so their keys don't
+                # contain the parameter prefix and were thus not remapped by _insert_adapter_name_into_state_dict.
+                # Without inserting the adapter name here, they would not be restored by load_state_dict below.
+                peft_model_state_dict[f"base_model.vera_A.{adapter_name}"] = peft_model_state_dict.pop(
+                    "base_model.vera_A"
+                )
+                peft_model_state_dict[f"base_model.vera_B.{adapter_name}"] = peft_model_state_dict.pop(
+                    "base_model.vera_B"
+                )
         elif config.peft_type == PeftType.TINYLORA:
             has_projection = any(".tinylora_P." in k for k in peft_model_state_dict)
             if config.save_projection and not has_projection:
@@ -838,6 +889,35 @@ def set_peft_model_state_dict(
                     "Specified to not load pvera_A and pvera_B from state dictionary. This means we will be relying on"
                     " PRNG initialisation to restore these projections using `config.projection_prng_key`, which may"
                     " not be accurate on all system configurations."
+                )
+
+            if "base_model.pvera_A" in peft_model_state_dict:
+                # The projections are shared between the layers and stored on the model itself, so their keys don't
+                # contain the parameter prefix and were thus not remapped by _insert_adapter_name_into_state_dict.
+                # Without inserting the adapter name here, they would not be restored by load_state_dict below.
+                peft_model_state_dict[f"base_model.pvera_A.{adapter_name}"] = peft_model_state_dict.pop(
+                    "base_model.pvera_A"
+                )
+                peft_model_state_dict[f"base_model.pvera_B.{adapter_name}"] = peft_model_state_dict.pop(
+                    "base_model.pvera_B"
+                )
+        elif config.peft_type == PeftType.FROD:
+            has_projection = any(
+                k.startswith(("base_model.frod_V.", "base_model.frod_s_indices.", "base_model.frod_s_size."))
+                for k in peft_model_state_dict
+            )
+            if config.save_projection and not has_projection:
+                raise ValueError(
+                    "Specified to load FRoD projection tensors from state dictionary however they were not present. "
+                    "If this checkpoint was saved with `save_projection=False`, set `peft_config.save_projection` "
+                    "to `False` before loading so the projections are regenerated from the base model weights. "
+                    "Otherwise, re-save the adapter with `save_projection=True` to include these tensors."
+                )
+            elif not config.save_projection and has_projection:
+                warnings.warn(
+                    "Specified to not load FRoD projection tensors from state dictionary however they are present. "
+                    "Consider using them to ensure checkpoint loading is correct by setting "
+                    "`peft_config.save_projection = True`."
                 )
         elif config.peft_type == PeftType.LORA:
             # Here we take care of a refactor of DoRA which changed lora_magnitude_vector from a ParameterDict to a
@@ -1043,3 +1123,191 @@ def load_peft_weights(
             remapped_adapters_weights[key_with_prefix] = val
 
     return remapped_adapters_weights
+
+
+def _get_adapter_state_dict_key_prefixes(model) -> set[str]:
+    """Collect state dict key prefixes for adapter parameters by inspecting the module tree.
+
+    For ``BaseTunerLayer`` modules every parameter/buffer is adapter-specific except those under ``base_layer`` (the
+    wrapped original module), so we collect every immediate child/parameter/buffer other than ``base_layer``. For
+    ``AuxiliaryTrainingWrapper`` modules it queries ``adapter_state_dict_load_map`` (the canonical source of adapter
+    keys) for each registered adapter, and falls back to ``other_param_names`` for non-saveable adapter attributes.
+    """
+    from peft.tuners.tuners_utils import BaseTunerLayer
+
+    adapter_key_prefixes: set[str] = set()
+    for module_name, module in model.base_model.model.named_modules():
+        if isinstance(module, AuxiliaryTrainingWrapper):
+            # Use adapter_state_dict_load_map to get the actual state dict keys owned by
+            # each adapter
+            for adapter_name in module._adapters:
+                load_map = module.adapter_state_dict_load_map(adapter_name)
+                for state_dict_key in load_map.values():
+                    prefix = f"{module_name}.{state_dict_key}" if module_name else state_dict_key
+                    adapter_key_prefixes.add(prefix)
+            for attr_name in module.other_param_names:
+                prefix = f"{module_name}.{attr_name}" if module_name else attr_name
+                adapter_key_prefixes.add(prefix)
+        elif isinstance(module, BaseTunerLayer):
+            # Everything on a tuner layer belongs to the adapter except the wrapped ``base_layer``. We enumerate the
+            # immediate children/parameters/buffers instead of relying on ``adapter_layer_names`` because some adapter
+            # parameters are registered dynamically and are not part of that static list (e.g. DoRA's
+            # ``lora_magnitude_vector``).
+            adapter_attr_names = (
+                [name for name, _ in module.named_children()]
+                + [name for name, _ in module.named_parameters(recurse=False)]
+                + [name for name, _ in module.named_buffers(recurse=False)]
+            )
+            for attr_name in adapter_attr_names:
+                if attr_name == "base_layer":
+                    continue
+                prefix = f"{module_name}.{attr_name}" if module_name else attr_name
+                adapter_key_prefixes.add(prefix)
+    return adapter_key_prefixes
+
+
+def _is_adapter_key(key: str, adapter_key_prefixes: set[str]) -> bool:
+    """Check if a state dict key belongs to an adapter parameter."""
+    return any(key == pfx or key.startswith(pfx + ".") for pfx in adapter_key_prefixes)
+
+
+def _peft_key_to_original_key(model, peft_key: str) -> str:
+    """Transform a PEFT state dict key to its original base model key.
+
+    Walks the module tree to strip wrapper infixes (``base_layer``, ``original_module``, and internal tuner modules
+    like ``token_adapter`` inside ``AuxiliaryTrainingWrapper``).
+
+    We walk the module tree rather than relying on a purely string-based transform (e.g. removing every
+    ``.base_layer.``/``.original_module.`` substring): the same token can legitimately be part of an original module
+    name and the infixes that need stripping depend on the *type* of the enclosing module (``BaseTunerLayer`` vs.
+    ``AuxiliaryTrainingWrapper`` vs. a regular module). By resolving each path component against the live module via
+    ``getattr`` we can check ``isinstance`` at every level and only strip a segment when it is genuinely a
+    PEFT-injected infix, which keeps this correct across the different (and weight-sharing) tuner structures.
+    """
+    from peft.tuners.tuners_utils import BaseTunerLayer
+
+    parts = peft_key.split(".")
+    original_parts: list[str] = []
+    current = model.base_model.model
+
+    for part in parts:
+        if current is None:
+            # Already past the module tree (e.g. nested parameter names)
+            original_parts.append(part)
+            continue
+
+        child = getattr(current, part, None)
+        if child is None or not isinstance(child, torch.nn.Module):
+            # Parameter/buffer name - keep it
+            original_parts.append(part)
+            current = None
+        elif part == "base_layer" and isinstance(current, BaseTunerLayer):
+            # Skip the base_layer infix inside a tuner
+            current = child
+        elif part == "original_module" and isinstance(current, AuxiliaryTrainingWrapper):
+            # Skip the original_module infix inside a wrapper
+            current = child
+        elif isinstance(child, BaseTunerLayer) and isinstance(current, AuxiliaryTrainingWrapper):
+            # Internal tuner inside a wrapper (e.g. token_adapter in TrainableTokensWrapper) - skip
+            current = child
+        elif isinstance(child, (BaseTunerLayer, AuxiliaryTrainingWrapper)):
+            # Tuner/wrapper that replaces an original module (e.g. LoRA at q_proj) - keep name
+            original_parts.append(part)
+            current = child
+        else:
+            # Regular module - keep name
+            original_parts.append(part)
+            current = child
+
+    return ".".join(original_parts)
+
+
+def get_base_model_state_dict(model) -> dict[str, torch.Tensor]:
+    """Return the state dict of the base model with the original model keys.
+
+    Extracts the base model's parameters from a PEFT-wrapped model, removing PEFT-specific key modifications and
+    filtering out adapter-specific parameters.
+
+    Args:
+        model: A ``PeftModel`` instance.
+
+    Returns:
+        The base model's state dict with original keys (without PEFT modifications).
+    """
+    # For prompt learning methods the base model structure is not modified, so the state
+    # dict already uses the original keys and contains no adapter-injected parameters.
+    if model._is_prompt_learning:
+        return dict(model.base_model.state_dict())
+
+    state_dict = model.base_model.model.state_dict()
+    adapter_key_prefixes = _get_adapter_state_dict_key_prefixes(model)
+
+    result: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if _is_adapter_key(key, adapter_key_prefixes):
+            continue
+        result[_peft_key_to_original_key(model, key)] = value
+
+    return result
+
+
+def set_base_model_state_dict(
+    model,
+    state_dict: dict[str, torch.Tensor],
+    strict: bool = True,
+):
+    """Load a state dict with original model keys into a PEFT-wrapped model.
+
+    Takes a state dict keyed by the original (pre-PEFT) model key names and loads it into the base model, automatically
+    translating keys to account for PEFT wrapper infixes (``base_layer``, ``original_module``, etc.).
+
+    This is the counterpart to :func:`get_base_model_state_dict` and is useful for scenarios like loading base model
+    weights after FSDP wrapping.
+
+    Args:
+        model: A ``PeftModel`` instance.
+        state_dict: The state dict with original model keys to load.
+        strict: Whether to strictly enforce that the keys match.  If ``True``,
+            raises ``RuntimeError`` on missing or unexpected keys.
+
+    Returns:
+        A ``namedtuple`` with ``missing_keys`` and ``unexpected_keys`` fields.
+    """
+    _IncompatibleKeys = namedtuple("IncompatibleKeys", ["missing_keys", "unexpected_keys"])
+
+    # For prompt learning methods the base model structure is not modified, so the state
+    # dict already uses the original keys and contains no adapter-injected parameters.
+    if model._is_prompt_learning:
+        return model.base_model.load_state_dict(state_dict, strict=strict)
+
+    current_state_dict = model.base_model.model.state_dict()
+    adapter_key_prefixes = _get_adapter_state_dict_key_prefixes(model)
+
+    # Build mapping: original_key → peft_key
+    original_to_peft_key: dict[str, str] = {}
+    for peft_key in current_state_dict.keys():
+        if _is_adapter_key(peft_key, adapter_key_prefixes):
+            continue
+        original_to_peft_key[_peft_key_to_original_key(model, peft_key)] = peft_key
+
+    peft_state_dict: dict[str, torch.Tensor] = {}
+    unexpected_keys: list[str] = []
+
+    for original_key, value in state_dict.items():
+        if original_key in original_to_peft_key:
+            peft_state_dict[original_to_peft_key[original_key]] = value
+        else:
+            unexpected_keys.append(original_key)
+
+    missing_keys = [k for k in original_to_peft_key if k not in state_dict]
+
+    if strict and (missing_keys or unexpected_keys):
+        error_msgs: list[str] = []
+        if missing_keys:
+            error_msgs.append(f"Missing key(s) in state_dict: {missing_keys}")
+        if unexpected_keys:
+            error_msgs.append(f"Unexpected key(s) in state_dict: {unexpected_keys}")
+        raise RuntimeError("Error(s) in loading state_dict:\n\t" + "\n\t".join(error_msgs))
+
+    model.base_model.model.load_state_dict(peft_state_dict, strict=False)
+    return _IncompatibleKeys(missing_keys=missing_keys, unexpected_keys=unexpected_keys)
