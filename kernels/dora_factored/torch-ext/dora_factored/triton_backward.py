@@ -191,6 +191,7 @@ def dora_backward(
     d_out: torch.Tensor,
     inner: torch.Tensor,
     mag_norm_scale: torch.Tensor,
+    lora_coeff: float = 0.7,
 ) -> torch.Tensor:
     """Launch the two-stage DoRA backward kernels.
 
@@ -200,8 +201,9 @@ def dora_backward(
 
     Args:
         d_out: Upstream gradient ``[num_rows, num_cols]`` w.r.t. the compose delta.
-        inner: Adapted weight ``base + 0.7·lora`` (= ``W + s·BA``) ``[num_rows, num_cols]``.
+        inner: Adapted weight ``base + lora_coeff·lora`` (= ``W + s·BA``) ``[num_rows, num_cols]``.
         mag_norm_scale: DoRA magnitude scale ``[num_cols]``.
+        lora_coeff: Coefficient for the lora term in the backward kernel (default: 0.7).
 
     Returns:
         A packed ``[2·num_rows + 1, num_cols]`` tensor (see module docstring for the row layout).
@@ -247,7 +249,7 @@ def dora_backward(
                 partial.stride(1),
                 r,
                 c,
-                0.7,
+                lora_coeff,
                 INPUT_IS_BF16=d_out.dtype == torch.bfloat16,
                 INPUT_IS_FP16=d_out.dtype == torch.float16,
                 BLOCK_M=BLOCK_M,

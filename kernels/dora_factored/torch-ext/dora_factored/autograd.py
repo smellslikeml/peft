@@ -46,12 +46,6 @@ from .triton_backward import dora_backward
 from .triton_compose_strided import dora_compose_strided
 
 
-# Coefficient the ported compose/backward kernels bake onto their `lora` input (see
-# triton_compose.py / triton_backward.py). The forward folds `scaling / _KERNEL_LORA_COEFF` into the
-# dense LoRA delta so this literal cancels for arbitrary caller `scaling`.
-_KERNEL_LORA_COEFF = 0.7
-
-
 class DoraFactoredFn(torch.autograd.Function):
     """Fused DoRA factored-norm forward + backward as a single differentiable op."""
 
@@ -64,28 +58,22 @@ class DoraFactoredFn(torch.autograd.Function):
         weight_norm = weight_norm.detach()
         mag = dora_scale / weight_norm  # [d_out]
 
-        # Fold the kernel's baked 0.7 into the dense LoRA delta so it cancels at any `scaling`.
+        # Compute dense LoRA delta — pass directly to kernel with lora_coeff=scaling.
         delta = lora_b @ lora_a  # [d_out, d_in]
-        lora_in = (scaling / _KERNEL_LORA_COEFF) * delta
 
         # The kernel applies `mag` per column (num_cols). PEFT's magnitude is per output feature
         # (d_out), so feed the transposed weight [d_in, d_out] to line num_cols up with mag.
         # Stage C fix: the strided kernel accepts explicit strides, so we pass zero-cost .t() views
-        # instead of materializing .t().contiguous() copies. Allocate output once and write into
-        # its transposed view.
-        out = torch.empty_like(base_weight)
-        compose_delta = dora_compose_strided(
-            lora_in.t(),  # [d_in, d_out] view, stride-aware
+        # instead of materializing .t().contiguous() copies. The kernel now fuses base+compose_delta.
+        out = dora_compose_strided(
+            delta.t(),  # [d_in, d_out] view, stride-aware — no pre-scaling
             base_weight.t(),  # [d_in, d_out] view, stride-aware
             mag,
-            out=out.t(),  # Write directly into transposed view of output
+            lora_coeff=scaling,  # Kernel folds this coefficient into the lora term
         ).t()  # View back to [d_out, d_in] — zero-cost
-        out = base_weight + compose_delta
 
-        # Adapted weight = base + 0.7·lora_in = W + s·BA, consumed by the backward kernel as `inner`.
-        inner = base_weight + scaling * delta
-
-        ctx.save_for_backward(base_weight, lora_a, lora_b, mag, weight_norm, inner)
+        # Save for backward — compute `inner` in backward instead of allocating it here.
+        ctx.save_for_backward(base_weight, lora_a, lora_b, mag, weight_norm, delta)
         ctx.scaling = scaling
         ctx.dora_scale_is_tensor = isinstance(dora_scale, torch.Tensor)
         ctx.dora_scale_ndim = dora_scale.ndim if ctx.dora_scale_is_tensor else 0
@@ -93,19 +81,22 @@ class DoraFactoredFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        base_weight, lora_a, lora_b, mag, weight_norm, inner = ctx.saved_tensors
+        base_weight, lora_a, lora_b, mag, weight_norm, delta = ctx.saved_tensors
         scaling = ctx.scaling
         d_in = base_weight.shape[1]  # num_rows in kernel orientation (weight is [d_out, d_in])
 
+        # Recompute inner = base_weight + scaling * delta (reference-style: costs matmul, saves allocation)
+        inner = base_weight + scaling * delta
+
         # Kernel orientation [num_rows=d_in, num_cols=d_out]; grad_output and inner are [d_out, d_in].
         # Stage C fix: pass zero-cost .t() views instead of materializing .t().contiguous() copies.
-        packed = dora_backward(grad_output.t(), inner.t(), mag)
+        packed = dora_backward(grad_output.t(), inner.t(), mag, lora_coeff=scaling)
         grad_lora_k = packed[0:d_in]    # [d_in, d_out] — grad w.r.t. the (pre-folded) lora input
         grad_base_k = packed[d_in : 2 * d_in]  # [d_in, d_out] — grad w.r.t. base, compose_delta path
         grad_mag = packed[2 * d_in]     # [d_out]
 
-        # Undo the scaling/0.7 fold, then chain the matmul backward into lora_a / lora_b.
-        grad_delta = (scaling / _KERNEL_LORA_COEFF) * grad_lora_k.t()  # [d_out, d_in] — zero-cost view
+        # Chain the matmul backward into lora_a / lora_b.
+        grad_delta = grad_lora_k.t()  # [d_out, d_in] — zero-cost view
         grad_lora_b = grad_delta @ lora_a.transpose(-2, -1)
         grad_lora_a = lora_b.transpose(-2, -1) @ grad_delta
 

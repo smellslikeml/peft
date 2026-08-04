@@ -63,6 +63,7 @@ def _fused_dora_compose_strided_kernel(
     stride_out1,
     num_rows,
     num_cols,
+    lora_coeff,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     CHUNK_N: tl.constexpr,
@@ -105,7 +106,7 @@ def _fused_dora_compose_strided_kernel(
             mag = tl.load(mag_ptr + cols, cache_modifier=".ca").to(tl.float32)
             lora = tl.load(lora_ptrs, cache_modifier=".cg").to(tl.float32)
             base = tl.load(base_ptrs, cache_modifier=".cg").to(tl.float32)
-            out = tl.fma((mag - 1.0)[None, :], base, (mag * 0.7)[None, :] * lora)
+            out = tl.fma(mag[None, :], base, (mag * lora_coeff)[None, :] * lora)
             tl.store(out_ptrs, out)
         else:
             col_mask = cols < num_cols
@@ -113,7 +114,7 @@ def _fused_dora_compose_strided_kernel(
             mag = tl.load(mag_ptr + cols, mask=col_mask, other=0.0, cache_modifier=".ca").to(tl.float32)
             lora = tl.load(lora_ptrs, mask=mask, other=0.0, cache_modifier=".cg").to(tl.float32)
             base = tl.load(base_ptrs, mask=mask, other=0.0, cache_modifier=".cg").to(tl.float32)
-            out = tl.fma((mag - 1.0)[None, :], base, (mag * 0.7)[None, :] * lora)
+            out = tl.fma(mag[None, :], base, (mag * lora_coeff)[None, :] * lora)
             tl.store(out_ptrs, out, mask=mask)
 
 
@@ -121,27 +122,28 @@ def dora_compose_strided(
     lora: torch.Tensor,
     base: torch.Tensor,
     mag_norm_scale: torch.Tensor,
+    lora_coeff: float = 0.7,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Launch the strided :func:`_fused_dora_compose_strided_kernel` over a 2D weight tile.
 
-    Accepts arbitrary-stride 2D tensors (including transposed views) and computes the same
-    compose_delta as :func:`triton_compose.dora_compose`:
+    Accepts arbitrary-stride 2D tensors (including transposed views) and computes the full DoRA
+    effective weight (base + compose_delta fused):
 
-        compose_delta = (mag - 1) ⊙ base + (mag · 0.7) ⊙ lora
+        out = mag ⊙ base + (mag · lora_coeff) ⊙ lora
 
     Args:
-        lora: Dense LoRA delta ``[num_rows, num_cols]`` (caller pre-folds ``scaling / 0.7``).
-            May be non-contiguous (e.g. a transposed view).
+        lora: Dense LoRA delta ``[num_rows, num_cols]``. May be non-contiguous (e.g. a transposed view).
         base: Base weight ``[num_rows, num_cols]``. May be non-contiguous.
         mag_norm_scale: DoRA magnitude scale ``[num_cols]`` (``= dora_scale / ||W + s·BA||``).
+        lora_coeff: Coefficient for the lora term (default: 0.7, matching the original kernel).
         out: Optional output tensor. If ``None``, allocates a contiguous output. If provided,
             writes into the caller's tensor (allowing direct write into a transposed view).
 
     Returns:
-        The *compose delta* of shape matching ``lora``/``base`` (same strides as input if ``out``
-        is ``None``, or same strides as ``out`` if provided). The caller adds ``base`` to recover
-        the DoRA effective weight.
+        The full DoRA effective weight of shape matching ``lora``/``base`` (same strides as input
+        if ``out`` is ``None``, or same strides as ``out`` if provided). No need to add ``base``
+        — the kernel fuses the full operation.
     """
     assert lora.is_cuda and base.is_cuda and mag_norm_scale.is_cuda
     assert lora.shape == base.shape
@@ -189,6 +191,7 @@ def dora_compose_strided(
         out.stride(1),
         num_rows,
         num_cols,
+        lora_coeff,
     )
 
     return out

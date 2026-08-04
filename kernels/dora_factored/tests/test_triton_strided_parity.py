@@ -52,6 +52,15 @@ TILE_SHAPES = [
 SCALINGS = [0.7, 1.0, 2.0]
 
 
+def _reference_compose_delta(mag, base, lora_in):
+    """Reference implementation of DoRA compose_delta with explicit broadcasting.
+
+    mag is [d_out]; base and lora_in are [d_out, d_in]. The kernel applies mag
+    column-wise, so we unsqueeze mag to [d_out, 1] to make the broadcast explicit.
+    """
+    return (mag - 1).unsqueeze(-1) * base + (mag * 0.7).unsqueeze(-1) * lora_in
+
+
 def _inputs(d_out, d_in, r, dtype, device):
     torch.manual_seed(0)
     base = torch.randn(d_out, d_in, dtype=dtype, device=device)
@@ -81,12 +90,11 @@ def test_strided_compose_kernel_contiguous(d_out, d_in, r, dtype, atol, rtol, sc
     delta = lora_b @ lora_a
     lora_in = (scaling / 0.7) * delta
     expected_base = base + lora_in
-    expected_delta = (mag - 1) * base + (mag * 0.7) * lora_in
+    expected_delta = _reference_compose_delta(mag, base, lora_in)
     expected_out = base + expected_delta
 
-    # Strided kernel: compute the compose_delta (same math as expected_delta)
-    compose_delta = dora_compose_strided(lora_in, base, mag)
-    actual_out = base + compose_delta
+    # Strided kernel: now returns the full effective weight (base + compose_delta fused)
+    actual_out = dora_compose_strided(lora_in, base, mag)
 
     torch.testing.assert_close(actual_out, expected_out, atol=atol, rtol=rtol)
 
@@ -111,13 +119,12 @@ def test_strided_compose_kernel_transposed(d_out, d_in, r, dtype, atol, rtol, sc
     delta = lora_b @ lora_a
     lora_in = (scaling / 0.7) * delta
     expected_base = base + lora_in
-    expected_delta = (mag - 1) * base + (mag * 0.7) * lora_in
+    expected_delta = _reference_compose_delta(mag, base, lora_in)
     expected_out = base + expected_delta
 
     # Strided kernel: pass transposed views (.t() without .contiguous())
     # The kernel should handle the strides correctly without materializing copies.
-    compose_delta = dora_compose_strided(lora_in.t(), base.t(), mag).t()
-    actual_out = base + compose_delta
+    actual_out = dora_compose_strided(lora_in.t(), base.t(), mag).t()
 
     torch.testing.assert_close(actual_out, expected_out, atol=atol, rtol=rtol)
 
@@ -133,15 +140,17 @@ def test_strided_compose_kernel_with_output_tensor(d_out, d_in, r, scaling):
     mag = dora_scale / weight_norm
     delta = lora_b @ lora_a
     lora_in = (scaling / 0.7) * delta
-    expected_delta = (mag - 1) * base + (mag * 0.7) * lora_in
+    expected_base = base + lora_in
+    expected_delta = _reference_compose_delta(mag, base, lora_in)
+    expected_out = base + expected_delta
 
     # Allocate output tensor and pass it to the kernel
     out = torch.empty_like(base)
-    compose_delta = dora_compose_strided(lora_in, base, mag, out=out)
+    result = dora_compose_strided(lora_in, base, mag, out=out)
 
-    # Verify the result matches and that `out` was mutated (not copied)
-    assert out.data_ptr() == compose_delta.data_ptr()
-    torch.testing.assert_close(compose_delta, expected_delta, atol=1e-5, rtol=1e-5)
+    # Verify the result matches the full effective weight and that `out` was mutated (not copied)
+    assert out.data_ptr() == result.data_ptr()
+    torch.testing.assert_close(result, expected_out, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize("scaling", SCALINGS)
@@ -156,12 +165,14 @@ def test_strided_compose_kernel_transposed_output(d_out, d_in, r, scaling):
     delta = lora_b @ lora_a
     lora_in = (scaling / 0.7) * delta
 
-    # Reference: expected result for [d_out, d_in] layout
-    expected_delta = (mag - 1) * base + (mag * 0.7) * lora_in
+    # Reference: expected result for [d_out, d_in] layout (full effective weight)
+    expected_base = base + lora_in
+    expected_delta = _reference_compose_delta(mag, base, lora_in)
+    expected_out = base + expected_delta
 
     # Allocate output and write into its transposed view
     out = torch.empty_like(base)
-    compose_delta = dora_compose_strided(
+    result = dora_compose_strided(
         lora_in.t(),  # [d_in, d_out] view
         base.t(),  # [d_in, d_out] view
         mag,
@@ -169,4 +180,4 @@ def test_strided_compose_kernel_transposed_output(d_out, d_in, r, scaling):
     ).t()  # View back to [d_out, d_in]
 
     # Verify the result matches the expected [d_out, d_in] layout
-    torch.testing.assert_close(compose_delta, expected_delta, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(result, expected_out, atol=1e-5, rtol=1e-5)
