@@ -21,14 +21,14 @@ transient working memory of a DoRA module at high rank (e.g. ~512 MB in bf16 for
 This module implements the *factored norm* introduced in "Scaling DoRA: High-Rank Adaptation via Factored Norms and
 Fused Kernels" (arXiv:2603.22276). The squared row norm expands into three terms that never require the dense product::
 
-    ||W_i + s·(BA)_i||^2 = ||W_i||^2  +  2s·<W_i, (BA)_i>  +  s^2·||(BA)_i||^2
-                         = base_i     +  2s·cross_i        +  s^2·gram_i
+    ||W_i + s·(BA)_i||^2 = ||W_i||^2 + 2s·<W_i, (BA)_i> + s^2·||(BA)_i||^2
+                         = base_i + 2s·cross_i + s^2·gram_i
 
 with intermediates that are ``O(d_out·r + r^2)`` instead of ``O(d_out·d_in)``:
 
-    * ``base``  = row-wise squared norm of ``W``                          (``[d_out]``)
-    * ``cross`` = ``(B * (W @ Aᵀ)).sum(dim=1)`` using ``W @ Aᵀ``          (``[d_out, r]`` intermediate)
-    * ``gram``  = ``(B @ (A @ Aᵀ) * B).sum(dim=1)`` using the ``r×r`` Gram (``[d_out, r]`` intermediate)
+    * ``base`` = row-wise squared norm of ``W`` (``[d_out]``)
+    * ``cross`` = ``(B * (W @ Aᵀ)).sum(dim=1)`` using ``W @ Aᵀ`` (``[d_out, r]`` intermediate)
+    * ``gram`` = ``(B @ (A @ Aᵀ) * B).sum(dim=1)`` using the ``r×r`` Gram (``[d_out, r]`` intermediate)
 
 The result equals ``torch.linalg.norm(W + s·BA, dim=1)`` up to floating-point accumulation order. The GPU-specific
 fused Triton kernels from the paper are intentionally out of scope for this reference implementation.
@@ -54,6 +54,16 @@ def factored_weight_norm(
     Returns:
         A tensor of shape ``[d_out]`` matching ``torch.linalg.norm(base_weight + scaling * lora_B @ lora_A, dim=1)``.
     """
+    # PEFT holds LoRA adapters in fp32 for training stability while base weights are typically bf16/fp16. The dense
+    # path masks this via PyTorch's implicit-promotion at ``base + s·BA``; matmul requires a strict dtype match, so
+    # promote to the higher-precision dtype at entry.
+    compute_dtype = torch.promote_types(base_weight.dtype, lora_A.dtype)
+    if base_weight.dtype != compute_dtype:
+        base_weight = base_weight.to(compute_dtype)
+    if lora_A.dtype != compute_dtype:
+        lora_A = lora_A.to(compute_dtype)
+        lora_B = lora_B.to(compute_dtype)
+
     # ||W_i||^2: squared norm of each base-weight row, no adapter involved.
     base = base_weight.pow(2).sum(dim=1)
 
