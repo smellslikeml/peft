@@ -27,9 +27,9 @@ from peft.tuners.lora.config import BdLoraConfig, MontecloraConfig
 from peft.utils.integrations import gather_params_ctx
 from peft.utils.other import transpose
 
+from . import dora as _dora_module
 from .arrow import ArrowLoraLinearLayer
 from .config import LoraConfig, PeftConfig
-from . import dora as _dora_module
 from .dora import (
     DoraConv1dLayer,
     DoraConv2dLayer,
