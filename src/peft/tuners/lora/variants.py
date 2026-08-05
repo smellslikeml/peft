@@ -29,8 +29,8 @@ from peft.utils.other import transpose
 
 from .arrow import ArrowLoraLinearLayer
 from .config import LoraConfig, PeftConfig
+from . import dora as _dora_module
 from .dora import (
-    USE_FACTORED_DORA_KERNEL,
     DoraConv1dLayer,
     DoraConv2dLayer,
     DoraConv3dLayer,
@@ -224,7 +224,7 @@ class DoraLinearVariant(LoraVariant):
         # different value
         module._cache_store(f"{active_adapter}-weight_norm", weight_norm)
 
-        dora_kernel = _get_dora_kernel() if USE_FACTORED_DORA_KERNEL else None
+        dora_kernel = _get_dora_kernel() if _dora_module.USE_FACTORED_DORA_KERNEL else None
         if dora_kernel is not None and dora_kernel._triton_available(orig_weight):
             # Fused Triton path: the kernel computes (dora_scale / ||W + s·BA||) ⊙ (W + s·BA) directly,
             # equivalent to the dense expression below within fp32 accumulation tolerance.
@@ -259,7 +259,7 @@ class DoraLinearVariant(LoraVariant):
         # different value
         module._cache_store(f"{active_adapter}-weight_norm", weight_norm)
 
-        dora_kernel = _get_dora_kernel() if USE_FACTORED_DORA_KERNEL else None
+        dora_kernel = _get_dora_kernel() if _dora_module.USE_FACTORED_DORA_KERNEL else None
         if dora_kernel is not None and dora_kernel._triton_available(orig_weight):
             # Fused Triton path — same math as merge_safe, writing back in place.
             lora_A = module.lora_A[active_adapter].weight
