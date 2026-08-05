@@ -54,6 +54,16 @@ def factored_weight_norm(
     Returns:
         A tensor of shape ``[d_out]`` matching ``torch.linalg.norm(base_weight + scaling * lora_B @ lora_A, dim=1)``.
     """
+    # PEFT holds LoRA adapters in fp32 for training stability while base weights are typically bf16/fp16. The dense
+    # path masks this via PyTorch's implicit-promotion at ``base + s·BA``; matmul requires a strict dtype match, so
+    # promote to the higher-precision dtype at entry.
+    compute_dtype = torch.promote_types(base_weight.dtype, lora_A.dtype)
+    if base_weight.dtype != compute_dtype:
+        base_weight = base_weight.to(compute_dtype)
+    if lora_A.dtype != compute_dtype:
+        lora_A = lora_A.to(compute_dtype)
+        lora_B = lora_B.to(compute_dtype)
+
     # ||W_i||^2: squared norm of each base-weight row, no adapter involved.
     base = base_weight.pow(2).sum(dim=1)
 
