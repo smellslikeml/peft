@@ -54,6 +54,22 @@ materializes ``[d_out, d_in]``, so a materializing kernel would offer no speedup
 default; the ``kernels`` library is optional.
 """
 
+USE_FACTORED_DORA_KERNEL_CUDA_GRAPH = False
+"""Whether to wrap the fused Triton merge path in a captured CUDA graph.
+
+Requires ``USE_FACTORED_DORA_KERNEL=True``. On first encounter with each unique
+``(d_out, d_in, rank, dtype, scaling)`` tuple, warms up + captures a graph (~150ms one-time). All
+subsequent modules of the same shape replay the graph — no Python-side per-launch overhead.
+
+On models with grouped-query attention (Llama-3, Qwen2.5, etc.), the two attention projection shapes
+map to two captures; the remaining ~110 modules replay. Under CUDA-graph replay, the wrapper's
+per-call cost collapses to a single ``cudaGraphLaunch`` syscall (~5-10µs) plus the tensor copies into
+the static buffers. Off by default because CUDA graphs require CUDA and the ``kernels`` runtime to be
+available, and because the memory overhead of the graph's static buffer pool grows with the number of
+unique shapes cached. Reset via ``peft.tuners.lora.variants._reset_merge_graph_cache()`` between
+adapter configs.
+"""
+
 
 def cache_decorator(cache_key: str):
     """Caching decorator for DoRA

@@ -45,6 +45,86 @@ from .velora import VeloraFunction, _get_group_dim, _normalize_projection, _resh
 _DORA_KERNEL = None
 _DORA_KERNEL_LOAD_ATTEMPTED = False
 
+# CUDA-graph cache for the fused merge path. Keyed by
+# ``(d_out, d_in, rank, base_dtype, adapter_dtype, scaling)`` — one graph per unique projection shape
+# per adapter. Populated on first encounter (warmup + capture, ~150ms one-time cost), replayed on
+# subsequent modules to eliminate Python-side per-launch overhead. Reset via ``_dora_module.reset_graph_cache()``
+# when switching adapter configs.
+_DORA_MERGE_GRAPH_CACHE: dict = {}
+
+
+def _reset_merge_graph_cache() -> None:
+    """Drop all captured CUDA graphs. Call before switching adapter configs or freeing GPU memory."""
+    global _DORA_MERGE_GRAPH_CACHE
+    _DORA_MERGE_GRAPH_CACHE = {}
+
+
+def _fused_merge_graphed(dora_kernel, orig_weight, lora_a, lora_b, scaling: float, dora_scale):
+    """CUDA-graph-cached fused merge.
+
+    First call for a given ``(shape, rank, dtype, scaling)`` warms up + captures a graph; subsequent
+    calls copy the caller's tensors into the graph's static input buffers and replay. On Qwen2.5-7B
+    with GQA there are two unique projection shapes (q/o and k/v), so 112 merges → 2 captures + 110
+    replays — enough to amortize capture cost.
+
+    Returns a fresh tensor with the merged effective weight; callers own the copy.
+    """
+    d_out, d_in = orig_weight.shape
+    r = lora_a.shape[0]
+    key = (d_out, d_in, r, orig_weight.dtype, lora_a.dtype, float(scaling))
+
+    entry = _DORA_MERGE_GRAPH_CACHE.get(key)
+    if entry is None:
+        # First-encounter capture. Allocate static buffers, warm up on a side stream, then capture.
+        device = orig_weight.device
+        static_base = torch.empty(d_out, d_in, device=device, dtype=orig_weight.dtype)
+        static_lora_a = torch.empty(r, d_in, device=device, dtype=lora_a.dtype)
+        static_lora_b = torch.empty(d_out, r, device=device, dtype=lora_b.dtype)
+        static_dora_scale = torch.empty_like(dora_scale)
+
+        static_base.copy_(orig_weight)
+        static_lora_a.copy_(lora_a)
+        static_lora_b.copy_(lora_b)
+        static_dora_scale.copy_(dora_scale)
+
+        # Warmup on a side stream — primes Triton autotune + JIT compile + allocator patterns
+        with torch.no_grad():
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(3):
+                    _ = dora_kernel.dora_factored_forward(
+                        static_base, static_lora_a, static_lora_b, scaling, static_dora_scale
+                    )
+            torch.cuda.current_stream().wait_stream(side)
+
+        # Capture the merge as a graph
+        g = torch.cuda.CUDAGraph()
+        with torch.no_grad(), torch.cuda.graph(g):
+            static_out = dora_kernel.dora_factored_forward(
+                static_base, static_lora_a, static_lora_b, scaling, static_dora_scale
+            )
+
+        entry = {
+            "graph": g,
+            "base": static_base,
+            "lora_a": static_lora_a,
+            "lora_b": static_lora_b,
+            "dora_scale": static_dora_scale,
+            "out": static_out,
+        }
+        _DORA_MERGE_GRAPH_CACHE[key] = entry
+        # First call's output is valid (capture just executed with the caller's inputs).
+        return static_out.clone()
+
+    # Fast path: replay
+    entry["base"].copy_(orig_weight)
+    entry["lora_a"].copy_(lora_a)
+    entry["lora_b"].copy_(lora_b)
+    entry["dora_scale"].copy_(dora_scale)
+    entry["graph"].replay()
+    return entry["out"].clone()
+
 
 def _get_dora_kernel() -> Optional[Any]:
     """Load the fused DoRA kernel from HF Hub, or return None if unavailable.
@@ -231,9 +311,11 @@ class DoraLinearVariant(LoraVariant):
             ).detach()
             module._cache_store(f"{active_adapter}-weight_norm", weight_norm)
 
-            new_weight = dora_kernel.dora_factored_forward(
-                transpose(orig_weight, module.fan_in_fan_out), lora_A, lora_B, scaling, dora_scale
-            )
+            base_t = transpose(orig_weight, module.fan_in_fan_out)
+            if _dora_module.USE_FACTORED_DORA_KERNEL_CUDA_GRAPH:
+                new_weight = _fused_merge_graphed(dora_kernel, base_t, lora_A, lora_B, scaling, dora_scale)
+            else:
+                new_weight = dora_kernel.dora_factored_forward(base_t, lora_A, lora_B, scaling, dora_scale)
             new_weight = transpose(new_weight, module.fan_in_fan_out).to(orig_dtype)
             return new_weight
 
@@ -275,9 +357,11 @@ class DoraLinearVariant(LoraVariant):
             ).detach()
             module._cache_store(f"{active_adapter}-weight_norm", weight_norm)
 
-            new_weight = dora_kernel.dora_factored_forward(
-                transpose(orig_weight.data, module.fan_in_fan_out), lora_A, lora_B, scaling, dora_scale
-            )
+            base_t = transpose(orig_weight.data, module.fan_in_fan_out)
+            if _dora_module.USE_FACTORED_DORA_KERNEL_CUDA_GRAPH:
+                new_weight = _fused_merge_graphed(dora_kernel, base_t, lora_A, lora_B, scaling, dora_scale)
+            else:
+                new_weight = dora_kernel.dora_factored_forward(base_t, lora_A, lora_B, scaling, dora_scale)
             orig_weight.data = transpose(new_weight, module.fan_in_fan_out).to(orig_dtype)
             return
 
