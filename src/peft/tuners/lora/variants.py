@@ -297,19 +297,14 @@ class DoraLinearVariant(LoraVariant):
 
         if use_fused:
             # Fused Triton path: skip the eager dense delta_weight + get_weight_norm computation
-            # entirely. The kernel materializes delta once for the compose step; we compute the norm
-            # for cache via the factored decomposition (cheap, no [d_out, d_in] intermediate).
-            from .factored_weight_norm import factored_weight_norm
-
+            # entirely. The weight-norm cache write is also skipped — the fused kernel computes the
+            # norm internally, and re-computing it here just for the cache is wasted work when the
+            # dominant caller (``merge_and_unload``) drops the adapter and never calls ``unmerge``.
+            # If ``unmerge`` *is* called later, the cache miss triggers a lazy recompute (see below).
             lora_A = module.lora_A[active_adapter].weight
             lora_B = module.lora_B[active_adapter].weight
             scaling = module.scaling[active_adapter]
             dora_scale = module.lora_magnitude_vector[active_adapter].weight
-
-            weight_norm = factored_weight_norm(
-                transpose(orig_weight, module.fan_in_fan_out), lora_A, lora_B, scaling
-            ).detach()
-            module._cache_store(f"{active_adapter}-weight_norm", weight_norm)
 
             base_t = transpose(orig_weight, module.fan_in_fan_out)
             if _dora_module.USE_FACTORED_DORA_KERNEL_CUDA_GRAPH:
@@ -345,17 +340,11 @@ class DoraLinearVariant(LoraVariant):
 
         if use_fused:
             # Fused Triton path — same math as merge_safe, writing back in place.
-            from .factored_weight_norm import factored_weight_norm
-
+            # Weight-norm cache write is skipped; see merge_safe for the rationale + unmerge fallback.
             lora_A = module.lora_A[active_adapter].weight
             lora_B = module.lora_B[active_adapter].weight
             scaling = module.scaling[active_adapter]
             dora_scale = module.lora_magnitude_vector[active_adapter].weight
-
-            weight_norm = factored_weight_norm(
-                transpose(orig_weight.data, module.fan_in_fan_out), lora_A, lora_B, scaling
-            ).detach()
-            module._cache_store(f"{active_adapter}-weight_norm", weight_norm)
 
             base_t = transpose(orig_weight.data, module.fan_in_fan_out)
             if _dora_module.USE_FACTORED_DORA_KERNEL_CUDA_GRAPH:
@@ -385,7 +374,20 @@ class DoraLinearVariant(LoraVariant):
     def unmerge(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> torch.Tensor:
         orig_dtype = orig_weight.dtype
         delta_weight = module.get_delta_weight(active_adapter)
-        weight_norm = module._cache_pop(f"{active_adapter}-weight_norm")
+        # Cache miss falls back to a lazy recompute — this happens when the fused merge path skipped
+        # the cache write (see merge_safe / merge_unsafe). The lazy recompute needs the *pre-merge*
+        # base weight; reconstruct it as ``orig_weight - delta_weight`` on the fly. Correctness is
+        # bit-identical to the eager cache; the cost only lands if ``unmerge`` is actually called.
+        try:
+            weight_norm = module._cache_pop(f"{active_adapter}-weight_norm")
+        except KeyError:
+            from .factored_weight_norm import factored_weight_norm
+
+            lora_A = module.lora_A[active_adapter].weight
+            lora_B = module.lora_B[active_adapter].weight
+            scaling = module.scaling[active_adapter]
+            pre_merge_base = transpose(orig_weight.data - delta_weight, module.fan_in_fan_out)
+            weight_norm = factored_weight_norm(pre_merge_base, lora_A, lora_B, scaling).detach()
         dora_factor = module.lora_magnitude_vector[active_adapter].weight / weight_norm
         new_weight = orig_weight.data / dora_factor.view(-1, 1) - delta_weight
         new_weight = new_weight.to(orig_dtype)
