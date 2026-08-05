@@ -64,9 +64,11 @@ def _get_dora_kernel() -> Optional[Any]:
 
         # trust_remote_code=True is required because the kernel is under a non-huggingface namespace.
         # Users opting in via USE_FACTORED_DORA_KERNEL have already accepted this by flipping the flag.
+        # Pinned to revision "v0.1.0" (git tag); swap to a semantic version=N once the kernel is
+        # promoted under kernels-community/ with a registered API contract.
         _DORA_KERNEL = get_kernel(
             "remyxai/dora-factored-kernel",
-            version=1,
+            revision="v0.1.0",
             trust_remote_code=True,
         )
     except Exception:
