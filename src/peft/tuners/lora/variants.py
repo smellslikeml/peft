@@ -211,9 +211,34 @@ class DoraLinearVariant(LoraVariant):
     @staticmethod
     def merge_safe(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> torch.Tensor:
         orig_dtype = orig_weight.dtype
-        delta_weight = module.get_delta_weight(active_adapter)
 
-        # since delta_weight already includes scaling, set it to 1 here
+        dora_kernel = _get_dora_kernel() if _dora_module.USE_FACTORED_DORA_KERNEL else None
+        use_fused = dora_kernel is not None and dora_kernel._triton_available(orig_weight)
+
+        if use_fused:
+            # Fused Triton path: skip the eager dense delta_weight + get_weight_norm computation
+            # entirely. The kernel materializes delta once for the compose step; we compute the norm
+            # for cache via the factored decomposition (cheap, no [d_out, d_in] intermediate).
+            from .factored_weight_norm import factored_weight_norm
+
+            lora_A = module.lora_A[active_adapter].weight
+            lora_B = module.lora_B[active_adapter].weight
+            scaling = module.scaling[active_adapter]
+            dora_scale = module.lora_magnitude_vector[active_adapter].weight
+
+            weight_norm = factored_weight_norm(
+                transpose(orig_weight, module.fan_in_fan_out), lora_A, lora_B, scaling
+            ).detach()
+            module._cache_store(f"{active_adapter}-weight_norm", weight_norm)
+
+            new_weight = dora_kernel.dora_factored_forward(
+                transpose(orig_weight, module.fan_in_fan_out), lora_A, lora_B, scaling, dora_scale
+            )
+            new_weight = transpose(new_weight, module.fan_in_fan_out).to(orig_dtype)
+            return new_weight
+
+        # Dense path — unchanged
+        delta_weight = module.get_delta_weight(active_adapter)
         weight_norm = (
             module.lora_magnitude_vector[active_adapter]
             .get_weight_norm(orig_weight, transpose(delta_weight, module.fan_in_fan_out), scaling=1)
@@ -223,22 +248,6 @@ class DoraLinearVariant(LoraVariant):
         # cannot calculate it on the fly based on the merged weights when unmerging because its a
         # different value
         module._cache_store(f"{active_adapter}-weight_norm", weight_norm)
-
-        dora_kernel = _get_dora_kernel() if _dora_module.USE_FACTORED_DORA_KERNEL else None
-        if dora_kernel is not None and dora_kernel._triton_available(orig_weight):
-            # Fused Triton path: the kernel computes (dora_scale / ||W + s·BA||) ⊙ (W + s·BA) directly,
-            # equivalent to the dense expression below within fp32 accumulation tolerance.
-            lora_A = module.lora_A[active_adapter].weight
-            lora_B = module.lora_B[active_adapter].weight
-            scaling = module.scaling[active_adapter]
-            dora_scale = module.lora_magnitude_vector[active_adapter].weight
-            new_weight = dora_kernel.dora_factored_forward(
-                transpose(orig_weight, module.fan_in_fan_out), lora_A, lora_B, scaling, dora_scale
-            )
-            new_weight = transpose(new_weight, module.fan_in_fan_out).to(orig_dtype)
-            return new_weight
-
-        # Dense path
         dora_factor = module.lora_magnitude_vector[active_adapter].weight / weight_norm
         dora_factor = transpose(dora_factor.view(-1, 1), module.fan_in_fan_out)
         new_weight = dora_factor * (orig_weight + delta_weight)
@@ -248,29 +257,38 @@ class DoraLinearVariant(LoraVariant):
     @staticmethod
     def merge_unsafe(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> None:
         orig_dtype = orig_weight.dtype
+
+        dora_kernel = _get_dora_kernel() if _dora_module.USE_FACTORED_DORA_KERNEL else None
+        use_fused = dora_kernel is not None and dora_kernel._triton_available(orig_weight)
+
+        if use_fused:
+            # Fused Triton path — same math as merge_safe, writing back in place.
+            from .factored_weight_norm import factored_weight_norm
+
+            lora_A = module.lora_A[active_adapter].weight
+            lora_B = module.lora_B[active_adapter].weight
+            scaling = module.scaling[active_adapter]
+            dora_scale = module.lora_magnitude_vector[active_adapter].weight
+
+            weight_norm = factored_weight_norm(
+                transpose(orig_weight.data, module.fan_in_fan_out), lora_A, lora_B, scaling
+            ).detach()
+            module._cache_store(f"{active_adapter}-weight_norm", weight_norm)
+
+            new_weight = dora_kernel.dora_factored_forward(
+                transpose(orig_weight.data, module.fan_in_fan_out), lora_A, lora_B, scaling, dora_scale
+            )
+            orig_weight.data = transpose(new_weight, module.fan_in_fan_out).to(orig_dtype)
+            return
+
+        # Dense path — unchanged
         delta_weight = module.get_delta_weight(active_adapter)
         weight_norm = (
             module.lora_magnitude_vector[active_adapter]
             .get_weight_norm(orig_weight, transpose(delta_weight, module.fan_in_fan_out), scaling=1)
             .detach()
         )
-        # We need to cache weight_norm because it has to be based on the original weights. We
-        # cannot calculate it on the fly based on the merged weights when unmerging because its a
-        # different value
         module._cache_store(f"{active_adapter}-weight_norm", weight_norm)
-
-        dora_kernel = _get_dora_kernel() if _dora_module.USE_FACTORED_DORA_KERNEL else None
-        if dora_kernel is not None and dora_kernel._triton_available(orig_weight):
-            # Fused Triton path — same math as merge_safe, writing back in place.
-            lora_A = module.lora_A[active_adapter].weight
-            lora_B = module.lora_B[active_adapter].weight
-            scaling = module.scaling[active_adapter]
-            dora_scale = module.lora_magnitude_vector[active_adapter].weight
-            new_weight = dora_kernel.dora_factored_forward(
-                transpose(orig_weight.data, module.fan_in_fan_out), lora_A, lora_B, scaling, dora_scale
-            )
-            orig_weight.data = transpose(new_weight, module.fan_in_fan_out).to(orig_dtype)
-            return
 
         # Dense path
         dora_factor = module.lora_magnitude_vector[active_adapter].weight / weight_norm
