@@ -75,6 +75,19 @@ For [`meta-llama/Llama-3.1-8B`](https://huggingface.co/meta-llama/Llama-3.1-8B),
 
 Caching can thus make inference with DoRA significantly faster but it also requires significantly more memory. Ideally, if the use case allows it, just merge the DoRA adapter to avoid both memory and runtime overhead.
 
+### High-rank memory reduction
+
+At high LoRA rank the DoRA weight-norm computation materialises the dense `B @ A` product (shape `[d_out, d_in]`), which dominates transient memory. Setting the module-level `USE_FACTORED_DORA_NORM` flag computes the same row-norm via a factored identity that never materialises that dense product:
+
+```py
+from peft.tuners.lora import dora
+dora.USE_FACTORED_DORA_NORM = True
+```
+
+The factored path is numerically equivalent to the dense path (within accumulation-order tolerance). At `d_in=8192, r=384` in bf16 that's roughly **20 MB vs ~500 MB per DoRA module** in transient memory, with a small per-step training-time speedup on high-rank fine-tunes. Default is `False` — flip when memory pressure becomes the bottleneck at high rank.
+
+Based on *Scaling DoRA: High-Rank Adaptation via Factored Norms and Fused Kernels* ([arXiv:2603.22276](https://arxiv.org/abs/2603.22276)); this is the plain-PyTorch reference implementation of the paper's algebraic identity, without the paper's fused Triton kernels.
+
 ## Caveats
 
 - DoRA only supports embedding, linear, and Conv2d layers at the moment.
