@@ -34,6 +34,7 @@ import huggingface_hub
 import numpy as np
 import torch
 import transformers
+from preconditioned_optimizer import create_riemannian_optimizer
 from torch import nn
 from transformers import (
     AutoModelForCausalLM,
@@ -84,7 +85,7 @@ class TrainConfig:
         query_template: The template for the query
         seed: The random seed
         grad_norm_clip: The gradient norm clipping value (set to 0 to skip)
-        optimizer_type: The name of a torch optimizer (e.g. AdamW) or a PEFT method ("lora+", "lora-fa")
+        optimizer_type: The name of a torch optimizer (e.g. AdamW) or a PEFT method ("lora+", "lora-fa", "riemannian")
         optimizer_kwargs: The optimizer keyword arguments (lr etc.)
         lr_scheduler: The learning rate scheduler (currently only None or 'cosine' are supported)
         use_amp: Whether to use automatic mixed precision
