@@ -14,6 +14,12 @@ observed_landing_zones:
     timestamp: '2026-07-13T23:49:58Z'
     pr: 9
   last_observed: '2026-07-13T23:49:58Z'
-rejected_shapes: []
+rejected_shapes:
+- shape_tag: null
+  reason_code: null
+  reason_summary: ''
+  observed:
+  - arxiv: '2608.04783'
+    timestamp: '2026-08-10T18:42:48Z'
 coordination_signals: []
-last_updated: '2026-07-13T23:49:58Z'
+last_updated: '2026-08-10T18:42:48Z'
