@@ -27,12 +27,134 @@ from peft.tuners.lora.config import BdLoraConfig, MontecloraConfig
 from peft.utils.integrations import gather_params_ctx
 from peft.utils.other import transpose
 
+from . import dora as _dora_module
 from .arrow import ArrowLoraLinearLayer
 from .config import LoraConfig, PeftConfig
-from .dora import DoraConv1dLayer, DoraConv2dLayer, DoraConv3dLayer, DoraEmbeddingLayer, DoraLinearLayer
+from .dora import (
+    DoraConv1dLayer,
+    DoraConv2dLayer,
+    DoraConv3dLayer,
+    DoraEmbeddingLayer,
+    DoraLinearLayer,
+)
 from .layer import Conv1d, Conv2d, Conv3d, Embedding, Linear, LoraLayer, LoraVariant, _ConvNd
 from .monteclora import MontecloraSampler
 from .velora import VeloraFunction, _get_group_dim, _normalize_projection, _reshape_to_grouped_subtokens
+
+
+_DORA_KERNEL = None
+_DORA_KERNEL_LOAD_ATTEMPTED = False
+
+# CUDA-graph cache for the fused merge path. Keyed by
+# ``(d_out, d_in, rank, base_dtype, adapter_dtype, scaling)`` — one graph per unique projection shape
+# per adapter. Populated on first encounter (warmup + capture, ~150ms one-time cost), replayed on
+# subsequent modules to eliminate Python-side per-launch overhead. Reset via ``_dora_module.reset_graph_cache()``
+# when switching adapter configs.
+_DORA_MERGE_GRAPH_CACHE: dict = {}
+
+
+def _reset_merge_graph_cache() -> None:
+    """Drop all captured CUDA graphs. Call before switching adapter configs or freeing GPU memory."""
+    global _DORA_MERGE_GRAPH_CACHE
+    _DORA_MERGE_GRAPH_CACHE = {}
+
+
+def _fused_merge_graphed(dora_kernel, orig_weight, lora_a, lora_b, scaling: float, dora_scale):
+    """CUDA-graph-cached fused merge.
+
+    First call for a given ``(shape, rank, dtype, scaling)`` warms up + captures a graph; subsequent
+    calls copy the caller's tensors into the graph's static input buffers and replay. On Qwen2.5-7B
+    with GQA there are two unique projection shapes (q/o and k/v), so 112 merges → 2 captures + 110
+    replays — enough to amortize capture cost.
+
+    Returns a fresh tensor with the merged effective weight; callers own the copy.
+    """
+    d_out, d_in = orig_weight.shape
+    r = lora_a.shape[0]
+    key = (d_out, d_in, r, orig_weight.dtype, lora_a.dtype, float(scaling))
+
+    entry = _DORA_MERGE_GRAPH_CACHE.get(key)
+    if entry is None:
+        # First-encounter capture. Allocate static buffers, warm up on a side stream, then capture.
+        device = orig_weight.device
+        static_base = torch.empty(d_out, d_in, device=device, dtype=orig_weight.dtype)
+        static_lora_a = torch.empty(r, d_in, device=device, dtype=lora_a.dtype)
+        static_lora_b = torch.empty(d_out, r, device=device, dtype=lora_b.dtype)
+        static_dora_scale = torch.empty_like(dora_scale)
+
+        static_base.copy_(orig_weight)
+        static_lora_a.copy_(lora_a)
+        static_lora_b.copy_(lora_b)
+        static_dora_scale.copy_(dora_scale)
+
+        # Warmup on a side stream — primes Triton autotune + JIT compile + allocator patterns
+        with torch.no_grad():
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(3):
+                    _ = dora_kernel.dora_factored_forward(
+                        static_base, static_lora_a, static_lora_b, scaling, static_dora_scale
+                    )
+            torch.cuda.current_stream().wait_stream(side)
+
+        # Capture the merge as a graph
+        g = torch.cuda.CUDAGraph()
+        with torch.no_grad(), torch.cuda.graph(g):
+            static_out = dora_kernel.dora_factored_forward(
+                static_base, static_lora_a, static_lora_b, scaling, static_dora_scale
+            )
+
+        entry = {
+            "graph": g,
+            "base": static_base,
+            "lora_a": static_lora_a,
+            "lora_b": static_lora_b,
+            "dora_scale": static_dora_scale,
+            "out": static_out,
+        }
+        _DORA_MERGE_GRAPH_CACHE[key] = entry
+        # First call's output is valid (capture just executed with the caller's inputs).
+        return static_out.clone()
+
+    # Fast path: replay
+    entry["base"].copy_(orig_weight)
+    entry["lora_a"].copy_(lora_a)
+    entry["lora_b"].copy_(lora_b)
+    entry["dora_scale"].copy_(dora_scale)
+    entry["graph"].replay()
+    return entry["out"].clone()
+
+
+def _get_dora_kernel() -> Optional[Any]:
+    """Load the fused DoRA kernel from HF Hub, or return None if unavailable.
+
+    The optional ``kernels`` library is imported lazily on first call. When present, the kernel is
+    downloaded from ``remyxai/dora-factored-kernel`` (Apache-2.0) and cached in
+    ``~/.cache/huggingface/hub/``; subsequent calls hit the cache. When the library is missing or the
+    Hub load fails, returns ``None`` and ``USE_FACTORED_DORA_KERNEL`` becomes a no-op — behavior is
+    identical to the existing dense path.
+    """
+    global _DORA_KERNEL, _DORA_KERNEL_LOAD_ATTEMPTED
+    if _DORA_KERNEL_LOAD_ATTEMPTED:
+        return _DORA_KERNEL
+    _DORA_KERNEL_LOAD_ATTEMPTED = True
+    try:
+        from kernels import get_kernel
+
+        # trust_remote_code=True is required because the kernel is under a non-huggingface namespace.
+        # Users opting in via USE_FACTORED_DORA_KERNEL have already accepted this by flipping the flag.
+        # Pinned to revision "v0.1.0" (git tag); swap to a semantic version=N once the kernel is
+        # promoted under kernels-community/ with a registered API contract.
+        _DORA_KERNEL = get_kernel(
+            "remyxai/dora-factored-kernel",
+            revision="v0.1.0",
+            trust_remote_code=True,
+        )
+    except Exception:
+        # ImportError (kernels not installed) or any Hub-side load failure — silently fall back.
+        _DORA_KERNEL = None
+    return _DORA_KERNEL
 
 
 class ArrowLinearVariant(LoraVariant):
@@ -169,9 +291,31 @@ class DoraLinearVariant(LoraVariant):
     @staticmethod
     def merge_safe(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> torch.Tensor:
         orig_dtype = orig_weight.dtype
-        delta_weight = module.get_delta_weight(active_adapter)
 
-        # since delta_weight already includes scaling, set it to 1 here
+        dora_kernel = _get_dora_kernel() if _dora_module.USE_FACTORED_DORA_KERNEL else None
+        use_fused = dora_kernel is not None and dora_kernel._triton_available(orig_weight)
+
+        if use_fused:
+            # Fused Triton path: skip the eager dense delta_weight + get_weight_norm computation
+            # entirely. The weight-norm cache write is also skipped — the fused kernel computes the
+            # norm internally, and re-computing it here just for the cache is wasted work when the
+            # dominant caller (``merge_and_unload``) drops the adapter and never calls ``unmerge``.
+            # If ``unmerge`` *is* called later, the cache miss triggers a lazy recompute (see below).
+            lora_A = module.lora_A[active_adapter].weight
+            lora_B = module.lora_B[active_adapter].weight
+            scaling = module.scaling[active_adapter]
+            dora_scale = module.lora_magnitude_vector[active_adapter].weight
+
+            base_t = transpose(orig_weight, module.fan_in_fan_out)
+            if _dora_module.USE_FACTORED_DORA_KERNEL_CUDA_GRAPH:
+                new_weight = _fused_merge_graphed(dora_kernel, base_t, lora_A, lora_B, scaling, dora_scale)
+            else:
+                new_weight = dora_kernel.dora_factored_forward(base_t, lora_A, lora_B, scaling, dora_scale)
+            new_weight = transpose(new_weight, module.fan_in_fan_out).to(orig_dtype)
+            return new_weight
+
+        # Dense path — unchanged
+        delta_weight = module.get_delta_weight(active_adapter)
         weight_norm = (
             module.lora_magnitude_vector[active_adapter]
             .get_weight_norm(orig_weight, transpose(delta_weight, module.fan_in_fan_out), scaling=1)
@@ -190,16 +334,36 @@ class DoraLinearVariant(LoraVariant):
     @staticmethod
     def merge_unsafe(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> None:
         orig_dtype = orig_weight.dtype
+
+        dora_kernel = _get_dora_kernel() if _dora_module.USE_FACTORED_DORA_KERNEL else None
+        use_fused = dora_kernel is not None and dora_kernel._triton_available(orig_weight)
+
+        if use_fused:
+            # Fused Triton path — same math as merge_safe, writing back in place.
+            # Weight-norm cache write is skipped; see merge_safe for the rationale + unmerge fallback.
+            lora_A = module.lora_A[active_adapter].weight
+            lora_B = module.lora_B[active_adapter].weight
+            scaling = module.scaling[active_adapter]
+            dora_scale = module.lora_magnitude_vector[active_adapter].weight
+
+            base_t = transpose(orig_weight.data, module.fan_in_fan_out)
+            if _dora_module.USE_FACTORED_DORA_KERNEL_CUDA_GRAPH:
+                new_weight = _fused_merge_graphed(dora_kernel, base_t, lora_A, lora_B, scaling, dora_scale)
+            else:
+                new_weight = dora_kernel.dora_factored_forward(base_t, lora_A, lora_B, scaling, dora_scale)
+            orig_weight.data = transpose(new_weight, module.fan_in_fan_out).to(orig_dtype)
+            return
+
+        # Dense path — unchanged
         delta_weight = module.get_delta_weight(active_adapter)
         weight_norm = (
             module.lora_magnitude_vector[active_adapter]
             .get_weight_norm(orig_weight, transpose(delta_weight, module.fan_in_fan_out), scaling=1)
             .detach()
         )
-        # We need to cache weight_norm because it has to be based on the original weights. We
-        # cannot calculate it on the fly based on the merged weights when unmerging because its a
-        # different value
         module._cache_store(f"{active_adapter}-weight_norm", weight_norm)
+
+        # Dense path
         dora_factor = module.lora_magnitude_vector[active_adapter].weight / weight_norm
         dora_factor = transpose(dora_factor.view(-1, 1), module.fan_in_fan_out)
         new_weight = dora_factor * (orig_weight.data + delta_weight)
@@ -210,7 +374,20 @@ class DoraLinearVariant(LoraVariant):
     def unmerge(module: Linear, active_adapter: str, orig_weight: torch.Tensor) -> torch.Tensor:
         orig_dtype = orig_weight.dtype
         delta_weight = module.get_delta_weight(active_adapter)
-        weight_norm = module._cache_pop(f"{active_adapter}-weight_norm")
+        # Cache miss falls back to a lazy recompute — this happens when the fused merge path skipped
+        # the cache write (see merge_safe / merge_unsafe). The lazy recompute needs the *pre-merge*
+        # base weight; reconstruct it as ``orig_weight - delta_weight`` on the fly. Correctness is
+        # bit-identical to the eager cache; the cost only lands if ``unmerge`` is actually called.
+        try:
+            weight_norm = module._cache_pop(f"{active_adapter}-weight_norm")
+        except KeyError:
+            from .factored_weight_norm import factored_weight_norm
+
+            lora_A = module.lora_A[active_adapter].weight
+            lora_B = module.lora_B[active_adapter].weight
+            scaling = module.scaling[active_adapter]
+            pre_merge_base = transpose(orig_weight.data - delta_weight, module.fan_in_fan_out)
+            weight_norm = factored_weight_norm(pre_merge_base, lora_A, lora_B, scaling).detach()
         dora_factor = module.lora_magnitude_vector[active_adapter].weight / weight_norm
         dora_factor = transpose(dora_factor.view(-1, 1), module.fan_in_fan_out)
         new_weight = orig_weight.data / dora_factor - delta_weight

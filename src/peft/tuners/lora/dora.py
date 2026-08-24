@@ -38,6 +38,38 @@ DoRA at the cost of a slightly different floating-point accumulation order. See 
 default to preserve the exact numerics of the existing implementation.
 """
 
+USE_FACTORED_DORA_KERNEL = False
+"""Whether to use the fused Triton kernel for DoRA weight-merge operations.
+
+When enabled and the optional ``kernels`` library is installed with CUDA + Triton available,
+``DoraLinearVariant.merge_safe`` / ``merge_unsafe`` compute the merged effective weight
+``(dora_scale / ||W + s·BA||) ⊙ (W + s·BA)`` via the fused kernel from
+``remyxai/dora-factored-kernel`` on HF Hub (loaded through ``kernels.get_kernel(...)``). Otherwise the
+existing dense path is used unchanged.
+
+Orthogonal to ``USE_FACTORED_DORA_NORM``: that flag controls the *norm* math; this one controls the
+*materialize* path (merge/unmerge). The runtime forward path (``DoraLinearLayer.forward``,
+``DoraLinearVariant.forward``) is unaffected — it applies the DoRA rescale to activations and never
+materializes ``[d_out, d_in]``, so a materializing kernel would offer no speedup there. Off by
+default; the ``kernels`` library is optional.
+"""
+
+USE_FACTORED_DORA_KERNEL_CUDA_GRAPH = False
+"""Whether to wrap the fused Triton merge path in a captured CUDA graph.
+
+Requires ``USE_FACTORED_DORA_KERNEL=True``. On first encounter with each unique
+``(d_out, d_in, rank, dtype, scaling)`` tuple, warms up + captures a graph (~150ms one-time). All
+subsequent modules of the same shape replay the graph — no Python-side per-launch overhead.
+
+On models with grouped-query attention (Llama-3, Qwen2.5, etc.), the two attention projection shapes
+map to two captures; the remaining ~110 modules replay. Under CUDA-graph replay, the wrapper's
+per-call cost collapses to a single ``cudaGraphLaunch`` syscall (~5-10µs) plus the tensor copies into
+the static buffers. Off by default because CUDA graphs require CUDA and the ``kernels`` runtime to be
+available, and because the memory overhead of the graph's static buffer pool grows with the number of
+unique shapes cached. Reset via ``peft.tuners.lora.variants._reset_merge_graph_cache()`` between
+adapter configs.
+"""
+
 
 def cache_decorator(cache_key: str):
     """Caching decorator for DoRA
