@@ -45,7 +45,12 @@ from transformers import (
 
 import peft
 from peft import PeftConfig, get_peft_model
-from peft.optimizers import create_lorafa_optimizer, create_loraplus_optimizer, create_riemannian_optimizer
+from peft.optimizers import (
+    create_lorafa_optimizer,
+    create_loraplus_optimizer,
+    create_riemannian_optimizer,
+    create_smuon_optimizer,
+)
 from peft.utils import SAFETENSORS_WEIGHTS_NAME, infer_device
 
 
@@ -133,7 +138,7 @@ class TrainConfig:
             raise ValueError(f"Invalid eval_steps: {self.eval_steps} > max_steps: {self.max_steps}")
         if self.grad_norm_clip < 0:
             raise ValueError(f"Invalid grad_norm_clip: {self.grad_norm_clip}")
-        if self.optimizer_type not in ["lora+", "lora-fa", "riemannian"] and not hasattr(
+        if self.optimizer_type not in ["lora+", "lora-fa", "riemannian", "smuon"] and not hasattr(
             torch.optim, self.optimizer_type
         ):
             raise ValueError(f"Invalid optimizer_type: {self.optimizer_type}")
@@ -291,6 +296,8 @@ def get_optimizer_and_scheduler(
         optimizer = create_lorafa_optimizer(model, **optimizer_kwargs)
     elif optimizer_type == "riemannian":
         optimizer = create_riemannian_optimizer(model, optimizer_cls=torch.optim.AdamW, **optimizer_kwargs)
+    elif optimizer_type == "smuon":
+        optimizer = create_smuon_optimizer(model, optimizer_cls=torch.optim.AdamW, **optimizer_kwargs)
     else:
         cls = getattr(torch.optim, optimizer_type)
         optimizer = cls(model.parameters(), **optimizer_kwargs)

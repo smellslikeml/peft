@@ -1,0 +1,9 @@
+{
+  "optimizer_type": "smuon",
+  "optimizer_kwargs": {
+    "lr": 2e-4,
+    "weight_decay": 0.01,
+    "beta": 0.9,
+    "eps": 0.0001
+  }
+}
