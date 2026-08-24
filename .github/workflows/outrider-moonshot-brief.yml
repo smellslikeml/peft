@@ -1,0 +1,63 @@
+name: Outrider Moonshot brief draft (peft)
+
+# One-off brief-mode dispatch (sMuon LoRA optimizer, arXiv:2608.14492).
+# Mirrors outrider-moonshot-refine-smoke.yml's native provider:moonshot / model:kimi-k3
+# invocation, but exposes lead-content / pin-arxiv / start-from-ref as inputs so the
+# full implementation brief can be passed at dispatch time.
+# Manual-only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      lead-content:
+        description: 'Fully-specified implementation brief (the spec).'
+        required: true
+      pin-arxiv:
+        description: 'arxiv id — research/fidelity anchor (does not drive selection here).'
+        required: false
+        default: ''
+      start-from-ref:
+        description: 'Base ref for the coding session (pristine upstream SHA).'
+        required: false
+        default: ''
+      mode:
+        description: 'Run mode.'
+        required: false
+        default: 'brief'
+      publish:
+        description: 'pr or branch. branch = push without opening a PR (human review first).'
+        required: false
+        default: 'branch'
+
+concurrency:
+  group: outrider-moonshot-brief
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: remyxai/outrider@v1
+        env:
+          REMYX_API_KEY: ${{ secrets.REMYX_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+        with:
+          interest-id: 0ca0c752-ab5c-44b5-a097-42de9dc69fdd
+          provider: moonshot
+          model: kimi-k3
+          mode: ${{ inputs.mode }}
+          publish: ${{ inputs.publish }}
+          pin-arxiv: ${{ inputs.pin-arxiv }}
+          start-from-ref: ${{ inputs.start-from-ref }}
+          lead-content: ${{ inputs.lead-content }}
+          staged-synthesis: 'true'
+          maintain-state: 'false'
+          claude-timeout: '3600'
+          rate-limit-days: '0'
