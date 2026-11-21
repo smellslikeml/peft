@@ -91,6 +91,7 @@ class PeftType(str, enum.Enum):  # noqa: UP042
     HIRA = "HIRA"
     SHIRA = "SHIRA"
     C3A = "C3A"
+    SAMA = "SAMA"
     WAVEFT = "WAVEFT"
     OSF = "OSF"
     DELORA = "DELORA"

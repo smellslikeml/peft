@@ -1,0 +1,19 @@
+{
+  "auto_mapping": null,
+  "base_model_name_or_path": null,
+  "revision": null,
+  "inference_mode": false,
+  "task_type": "CAUSAL_LM",
+  "peft_type": "SAMA",
+  "n1": 8,
+  "m2": 8,
+  "alpha": 1.0,
+  "sigma": 0.0002,
+  "bias": "none",
+  "init_weights": true,
+  "target_modules": [
+    "q_proj",
+    "v_proj"
+  ],
+  "modules_to_save": null
+}

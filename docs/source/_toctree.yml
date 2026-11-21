@@ -79,6 +79,8 @@
         title: BOFT
       - local: package_reference/c3a
         title: C3A
+      - local: package_reference/sama
+        title: SaMA
       - local: package_reference/deft
         title: DEFT
       - local: package_reference/delora
@@ -178,6 +180,8 @@
       title: BOFT
     - local: package_reference/c3a
       title: C3A
+    - local: package_reference/sama
+      title: SaMA
     - local: package_reference/cartridges
       title: Cartridges
     - local: package_reference/cpt
