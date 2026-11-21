@@ -1,0 +1,42 @@
+name: sama-metamathqa
+question:
+  kind: capability
+  ask: >
+    Does SaMA (SaMA_16x16) reach competitive GSM8K accuracy on the PEFT method_comparison
+    benchmark (MetaMathQA fine-tune, Llama-3.2-3B) at its parameter budget — i.e. is the new
+    tuner worth adding to the library?
+benchmarks:
+  - name: metamathqa-gsm8k
+    suite: "command:python .remyx/sama_metamathqa_bench.py"
+    baseline: none
+    metrics:
+      - name: gsm8k_test_accuracy
+        direction: ">="
+        threshold: 0.472
+        role: target
+        bar: goal
+        reads_as: "GSM8K test accuracy after MetaMathQA fine-tune (beat full fine-tuning = 0.472; LoRA-r32 = 0.478)"
+      - name: trainable_params_m
+        role: cost
+        reads_as: "Trainable parameters (millions)"
+      - name: train_time_s
+        role: cost
+        reads_as: "Training wall-clock (s)"
+      - name: peak_mem_gb
+        role: cost
+        reads_as: "Peak accelerator memory (GB)"
+compute:
+  tier: gpu
+  timeout_s: 7200
+  timeout_max_s: 14400
+loop:
+  max_iterations: 3
+  fix_env: true
+  fix_code: true
+requires: []
+report:
+  headline: "SaMA on MetaMathQA/GSM8K vs the method_comparison baselines"
+  caveat: >
+    Single-seed, one SaMA config (16x16). Compares GSM8K accuracy at the SaMA parameter budget
+    against the shipped full-finetune (0.472) and LoRA-r32 (0.478) reference numbers. Gated base
+    model (Llama-3.2-3B) requires HF access on the runner.
